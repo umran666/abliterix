@@ -206,115 +206,123 @@ def extract_hidden_states_vllm(
         kwargs["quantization"] = "fp8"
 
     llm = LLM(**kwargs)
-
-    # Tokenize prompts.  Flatten every set into a single prompt list and
-    # remember each set's slice so we can split hidden states back on return.
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust)
-    except AttributeError as exc:
-        if "'list' object has no attribute 'keys'" not in str(exc):
-            raise
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_id,
-            trust_remote_code=trust,
-            extra_special_tokens={},
-        )
-    prompts: list[str] = []
-    set_slices: dict[str, tuple[int, int]] = {}
-    for set_name, messages in prompt_sets.items():
-        start = len(prompts)
-        for msg in messages:
-            chat = []
-            if msg.system:
-                chat.append({"role": "system", "content": msg.system})
-            chat.append({"role": "user", "content": msg.user})
-            try:
-                text = tokenizer.apply_chat_template(
-                    chat,
-                    add_generation_prompt=True,
-                    tokenize=False,
-                    enable_thinking=False,
-                )
-            except TypeError:
-                text = tokenizer.apply_chat_template(
-                    chat,
-                    add_generation_prompt=True,
-                    tokenize=False,
-                )
-            prompts.append(text)
-        set_slices[set_name] = (start, len(prompts))
-
-    set_summary = ", ".join(
-        f"{name}={end - start}" for name, (start, end) in set_slices.items()
-    )
-    print(
-        f"* Extracting hidden states for {len(prompts)} prompts "
-        f"({set_summary}; {num_layers} layers, TP={tp})..."
-    )
-
-    sampling_params = SamplingParams(max_tokens=1)
-    outputs = llm.generate(prompts, sampling_params)
-
-    # Collect hidden states from safetensors files.
-    batch_residuals: list[Tensor] = []
-    for out in outputs:
-        hs_path = out.kv_transfer_params.get("hidden_states_path")
-        if hs_path is None:
-            raise RuntimeError(
-                f"No hidden_states_path in output for request {out.request_id}. "
-                f"kv_transfer_params={out.kv_transfer_params}"
+        # Tokenize prompts.  Flatten every set into a single prompt list and
+        # remember each set's slice so we can split hidden states back on return.
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust)
+        except AttributeError as exc:
+            if "'list' object has no attribute 'keys'" not in str(exc):
+                raise
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                trust_remote_code=trust,
+                extra_special_tokens={},
             )
+        prompts: list[str] = []
+        set_slices: dict[str, tuple[int, int]] = {}
+        for set_name, messages in prompt_sets.items():
+            start = len(prompts)
+            for msg in messages:
+                chat = []
+                if msg.system:
+                    chat.append({"role": "system", "content": msg.system})
+                chat.append({"role": "user", "content": msg.user})
+                try:
+                    text = tokenizer.apply_chat_template(
+                        chat,
+                        add_generation_prompt=True,
+                        tokenize=False,
+                        enable_thinking=False,
+                    )
+                except TypeError:
+                    text = tokenizer.apply_chat_template(
+                        chat,
+                        add_generation_prompt=True,
+                        tokenize=False,
+                    )
+                prompts.append(text)
+            set_slices[set_name] = (start, len(prompts))
 
-        with safe_open(hs_path, "pt") as f:
-            hs = f.get_tensor("hidden_states")
+        set_summary = ", ".join(
+            f"{name}={end - start}" for name, (start, end) in set_slices.items()
+        )
+        print(
+            f"* Extracting hidden states for {len(prompts)} prompts "
+            f"({set_summary}; {num_layers} layers, TP={tp})..."
+        )
 
-        # vLLM's ExampleHiddenStatesConnector stores hidden states as
-        # [prompt_len, num_layers, hidden_dim] — NOT [num_layers, prompt_len,
-        # hidden_dim] as earlier versions of this file assumed.  The wrong
-        # ordering caused torch.stack across prompts to fail with
-        # "stack expects equal size, got [180, 2880] and [113, 2880]"
-        # (the varying 1st dim was prompt_len, not num_layers).
-        # Auto-detect which axis is the layer axis by finding the one whose
-        # length matches our known num_layers; fall back to the
-        # prompt_len-first interpretation since that's what we've observed
-        # on gpt-oss / vLLM 0.19.
-        if hs.dim() == 3:
-            if hs.shape[0] == num_layers:
-                # [num_layers, prompt_len, hidden_dim] — original assumption.
-                layer_vecs = hs[:, token_offset, :]
-            elif hs.shape[1] == num_layers:
-                # [prompt_len, num_layers, hidden_dim] — observed on gpt-oss.
-                layer_vecs = hs[token_offset, :, :]
+        sampling_params = SamplingParams(max_tokens=1)
+        outputs = llm.generate(prompts, sampling_params)
+
+        # Collect hidden states from safetensors files.
+        batch_residuals: list[Tensor] = []
+        for out in outputs:
+            hs_path = out.kv_transfer_params.get("hidden_states_path")
+            if hs_path is None:
+                raise RuntimeError(
+                    f"No hidden_states_path in output for request {out.request_id}. "
+                    f"kv_transfer_params={out.kv_transfer_params}"
+                )
+
+            with safe_open(hs_path, "pt") as f:
+                hs = f.get_tensor("hidden_states")
+
+            # vLLM's ExampleHiddenStatesConnector stores hidden states as
+            # [prompt_len, num_layers, hidden_dim] — NOT [num_layers, prompt_len,
+            # hidden_dim] as earlier versions of this file assumed.  The wrong
+            # ordering caused torch.stack across prompts to fail with
+            # "stack expects equal size, got [180, 2880] and [113, 2880]"
+            # (the varying 1st dim was prompt_len, not num_layers).
+            # Auto-detect which axis is the layer axis by finding the one whose
+            # length matches our known num_layers; fall back to the
+            # prompt_len-first interpretation since that's what we've observed
+            # on gpt-oss / vLLM 0.19.
+            if hs.dim() == 3:
+                if hs.shape[0] == num_layers:
+                    # [num_layers, prompt_len, hidden_dim] — original assumption.
+                    layer_vecs = hs[:, token_offset, :]
+                elif hs.shape[1] == num_layers:
+                    # [prompt_len, num_layers, hidden_dim] — observed on gpt-oss.
+                    layer_vecs = hs[token_offset, :, :]
+                else:
+                    raise RuntimeError(
+                        f"Unexpected hidden_states shape {list(hs.shape)} "
+                        f"(num_layers={num_layers}); neither dim 0 nor dim 1 "
+                        f"matches the layer count."
+                    )
             else:
                 raise RuntimeError(
-                    f"Unexpected hidden_states shape {list(hs.shape)} "
-                    f"(num_layers={num_layers}); neither dim 0 nor dim 1 "
-                    f"matches the layer count."
+                    f"Expected 3-D hidden_states tensor, got shape {list(hs.shape)}"
                 )
-        else:
-            raise RuntimeError(
-                f"Expected 3-D hidden_states tensor, got shape {list(hs.shape)}"
+
+            # Prepend zeros for embedding layer (index 0).
+            hidden_dim = layer_vecs.shape[1]
+            embedding_placeholder = torch.zeros(1, hidden_dim, dtype=layer_vecs.dtype)
+            batch_residuals.append(
+                torch.cat([embedding_placeholder, layer_vecs], dim=0)
             )
 
-        # Prepend zeros for embedding layer (index 0).
-        hidden_dim = layer_vecs.shape[1]
-        embedding_placeholder = torch.zeros(1, hidden_dim, dtype=layer_vecs.dtype)
-        batch_residuals.append(torch.cat([embedding_placeholder, layer_vecs], dim=0))
+        residuals = torch.stack(batch_residuals, dim=0).to(torch.float32)
 
-    residuals = torch.stack(batch_residuals, dim=0).to(torch.float32)
+        results: dict[str, Tensor] = {}
+        for set_name, (start, end) in set_slices.items():
+            results[set_name] = residuals[start:end].contiguous()
+            print(f"  [green]Ok[/] — {set_name}: shape {list(results[set_name].shape)}")
 
-    results: dict[str, Tensor] = {}
-    for set_name, (start, end) in set_slices.items():
-        results[set_name] = residuals[start:end].contiguous()
-        print(f"  [green]Ok[/] — {set_name}: shape {list(results[set_name].shape)}")
+    finally:
+        # Guaranteed teardown: on the exception path the caller's handler
+        # holds exc.__traceback__, which pins this frame and with it the
+        # vLLM engine (the fall-through `del llm` never ran), so no amount
+        # of gc in the handler could free the GPUs for the fallback
+        # backend.  Deleting the frame's slot here lets flush_memory()
+        # actually tear the engine down (issue #83 failure shape).
+        del llm
+        flush_memory()
 
-    # Cleanup: delete the LLM to free VRAM.
-    del llm
-    flush_memory()
+        # Clean up temp files.
+        import shutil
 
-    # Clean up temp files.
-    import shutil
-
-    shutil.rmtree(tmpdir, ignore_errors=True)
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     return results

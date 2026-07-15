@@ -161,17 +161,17 @@ def chunk_batches(items: list[T], batch_size: int) -> list[list[T]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
 
-def flush_memory():
-    """Release cached GPU / accelerator memory and run garbage collection.
-
-    gc.collect() is called both before and after clearing the backend cache
-    because Python's cycle collector must break reference loops before the
-    backend allocator can actually reclaim the underlying buffers.
-    """
-    gc.collect()
-
+def _empty_backend_cache():
+    """Return freed cached blocks from the accelerator allocator to the driver."""
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        # Never touch context-creating CUDA APIs (synchronize etc.) here: in
+        # a process that hasn't initialized CUDA (the fast vLLM-native
+        # extraction path keeps the driver process CPU-only), they would
+        # create a ~0.3-1 GB primary context on every GPU that the spawned
+        # TP workers then see as used.  empty_cache() itself no-ops when
+        # CUDA is uninitialized.
+        if torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
     elif is_xpu_available():
         torch.xpu.empty_cache()
     elif is_mlu_available():
@@ -183,7 +183,42 @@ def flush_memory():
     elif torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
-    gc.collect()
+
+def flush_memory(max_passes: int = 4):
+    """Release cached GPU / accelerator memory and run garbage collection.
+
+    Runs up to *max_passes* rounds of ``gc.collect()`` each followed by a
+    backend cache flush, stopping once a pass finds nothing to collect.
+
+    Python's cycle collector must break reference loops before the backend
+    allocator can reclaim the underlying buffers, and a single pass is not
+    always enough: finalizers and weakref callbacks that run during one
+    pass can drop the last reference to a tensor only after that pass, so
+    the tensor is reclaimed on a *later* pass.  The cache flush must then
+    run again — otherwise the freed VRAM stays *reserved* by the caching
+    allocator instead of being returned to the driver.  A multi-GPU HF
+    model unloaded that way kept ~148 GB reserved across the HF → vLLM
+    phase transition and the spawned vLLM TP workers refused to start
+    (issue #83).
+    """
+    for _ in range(max_passes):
+        collected = gc.collect()
+        _empty_backend_cache()
+        if not collected:
+            break
+
+
+def reserved_unallocated_vram() -> int:
+    """Bytes of VRAM this process's CUDA caching allocator holds beyond
+    live allocations, summed across devices.  Returns 0 on non-CUDA
+    backends.  Memory stuck here is invisible garbage to freshly spawned
+    processes (e.g. vLLM TP workers), which see it as used."""
+    if not torch.cuda.is_available():
+        return 0
+    n = torch.cuda.device_count()
+    reserved = sum(torch.cuda.memory_reserved(d) for d in range(n))
+    allocated = sum(torch.cuda.memory_allocated(d) for d in range(n))
+    return max(0, reserved - allocated)
 
 
 def slugify_model_name(model_name: str) -> str:

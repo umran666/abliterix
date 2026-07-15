@@ -47,6 +47,7 @@ from .util import (
     flush_memory,
     print,
     report_memory,
+    reserved_unallocated_vram,
     set_seed,
     slugify_model_name,
 )
@@ -977,6 +978,15 @@ def run():
             print()
             print(f"[bold]Phase transition: HF → {backend_name}[/]")
 
+            # Hidden-state stacks kept for later use (discriminative layer
+            # selection / non-LoRA steering) may still be GPU-resident when
+            # inference.offload_outputs_to_cpu=false; move them to CPU so the
+            # TP workers spawned below don't see that VRAM as used (issue #83).
+            if benign_states is not None:
+                benign_states = benign_states.cpu()
+            if target_states is not None:
+                target_states = target_states.cpu()
+
             # Build projection cache.  If the HF model is loaded (needed for
             # non-speculators path), use it.  Otherwise read weights directly
             # from safetensors on disk — avoids the 3+ min HF model load.
@@ -1026,6 +1036,21 @@ def run():
                     vectors,
                 )
             flush_memory()
+            # VRAM still reserved by this (HF-phase) process is invisible
+            # garbage to the TP workers spawned below — they count it as
+            # used memory and refuse to start ("Free memory on device ...
+            # is less than desired GPU memory utilization", issue #83).
+            _stuck = reserved_unallocated_vram()
+            if _stuck > 2 * 1024**3:
+                print(
+                    f"[yellow]Warning: {_stuck / 1024**3:.1f} GB of VRAM "
+                    f"is still reserved after unloading the HF model — "
+                    f"something is pinning the freed weights.  The "
+                    f"{backend_name} workers may fail to start with 'Free "
+                    f"memory on device' errors; if they do, please report "
+                    f"this at "
+                    f"https://github.com/wuwangzhang1216/abliterix/issues.[/]"
+                )
             report_memory()
 
             # Load model with tensor parallelism.

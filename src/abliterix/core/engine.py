@@ -1030,6 +1030,24 @@ class SteeringEngine:
         self._cached_n_layers = len(self.transformer_layers)
         self._cached_components = self.list_steerable_components()
 
+        # Drop every engine-held reference into the model being unloaded;
+        # anything left here pins the model's VRAM after
+        # ``engine.model = None`` (issue #83).
+        self._dequant_cache.clear()
+        for handle in getattr(self, "_angular_hooks", []):
+            handle.remove()
+        self._angular_hooks = []
+        for attr in (
+            "_lora_b_weights",
+            "_router_originals",
+            "_expert_deltas",
+            "_direct_weight_originals",
+            "_cliff_head_originals",
+        ):
+            buffers = getattr(self, attr, None)
+            if buffers is not None:
+                buffers.clear()
+
     # ------------------------------------------------------------------
     # MoE expert routing helpers
     # ------------------------------------------------------------------

@@ -13,18 +13,44 @@ vLLM, which CI does not have.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from abliterix.core.vllm_backend import (
+    _DEFAULT_VLLM_MAX_LORA_RANK,
     _MLA_ARCH_FRAGMENTS,
     _build_llm_kwargs,
+    _detect_model_metadata,
     _resolve_attention_backend,
     _resolve_compile_mode,
     _should_disable_custom_all_reduce,
 )
 from abliterix.settings import AbliterixConfig, ModelConfig
+
+
+def test_abliterix_default_vllm_rank_matches_projection_cache():
+    assert _DEFAULT_VLLM_MAX_LORA_RANK == 1
+
+
+# ---------------------------------------------------------------------------
+# Model topology detection
+# ---------------------------------------------------------------------------
+
+
+def test_detect_model_metadata_reads_moe_fields_from_hf_config():
+    """MoE auto-gating must use model topology, not only name heuristics."""
+    hf_config = SimpleNamespace(
+        architectures=["CustomDecoderForCausalLM"],
+        num_local_experts=64,
+        num_experts_per_tok=8,
+    )
+    with patch("transformers.AutoConfig.from_pretrained", return_value=hf_config):
+        assert _detect_model_metadata("dummy/model", False) == (
+            "CustomDecoderForCausalLM",
+            True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -218,15 +244,45 @@ def test_build_llm_kwargs_default_recipe():
     # PR #21 review item 2: enforce_eager kwarg must NOT be passed —
     # compilation_config encodes the same intent and we don't want both.
     assert "enforce_eager" not in kwargs
-    # Issue #22: routed_experts replaces collective_rpc probe by default.
-    assert kwargs["enable_return_routed_experts"] is True
+    # Dense models do not expose MoE routing metadata. Enabling routed-expert
+    # capture for them makes vLLM inspect missing expert config fields during
+    # engine startup, so the auto/default path must keep it off.
+    assert kwargs["enable_return_routed_experts"] is False
+    assert kwargs["enable_expert_parallel"] is False
+
+
+def test_build_llm_kwargs_auto_enables_expert_parallel_for_moe():
+    cfg = _make_config()
+    with patch("abliterix.core.vllm_backend.torch.cuda.device_count", return_value=1):
+        kwargs = _build_llm_kwargs(
+            cfg,
+            model_arch="CustomMoeForCausalLM",
+            is_fp8=False,
+            kv_cache_dtype=None,
+            lora_max_rank=1,
+            is_moe=True,
+        )
+
+    assert kwargs["enable_expert_parallel"] is True
+
+
+def test_build_llm_kwargs_rejects_explicit_expert_parallel_on_dense():
+    cfg = _make_config(enable_expert_parallel=True)
+
+    with pytest.raises(ValueError, match="expert parallelism.*dense"):
+        _build_llm_kwargs(
+            cfg,
+            model_arch="LlamaForCausalLM",
+            is_fp8=False,
+            kv_cache_dtype=None,
+            lora_max_rank=1,
+            is_moe=False,
+        )
 
 
 def test_build_llm_kwargs_routed_experts_can_be_disabled():
     """Issue #22: users can opt out of the routed_experts metadata cost
-    by setting ``vllm_return_routed_experts = false``. The kwarg still
-    appears (vLLM accepts both True and False), so the legacy
-    collective_rpc probe path can be re-enabled at config time."""
+    by setting ``vllm_return_routed_experts = false``, even on MoE."""
     cfg = _make_config(vllm_return_routed_experts=False)
     with patch("abliterix.core.vllm_backend.torch.cuda.device_count", return_value=1):
         with patch(
@@ -242,8 +298,53 @@ def test_build_llm_kwargs_routed_experts_can_be_disabled():
                     is_fp8=False,
                     kv_cache_dtype=None,
                     lora_max_rank=16,
+                    is_moe=True,
                 )
     assert kwargs["enable_return_routed_experts"] is False
+
+
+def test_build_llm_kwargs_auto_enables_routed_experts_for_moe():
+    """The default auto mode preserves routed-expert capture on MoE models."""
+    cfg = _make_config()
+    with patch("abliterix.core.vllm_backend.torch.cuda.device_count", return_value=1):
+        with patch(
+            "abliterix.core.vllm_backend.torch.cuda.is_available", return_value=True
+        ):
+            with patch(
+                "abliterix.core.vllm_backend.torch.cuda.get_device_capability",
+                return_value=(9, 0),
+            ):
+                kwargs = _build_llm_kwargs(
+                    cfg,
+                    model_arch="CustomDecoderForCausalLM",
+                    is_fp8=False,
+                    kv_cache_dtype=None,
+                    lora_max_rank=16,
+                    is_moe=True,
+                )
+    assert kwargs["enable_return_routed_experts"] is True
+
+
+def test_build_llm_kwargs_explicit_routed_experts_true_wins_on_dense():
+    """An explicit recipe override remains a literal vLLM pass-through."""
+    cfg = _make_config(vllm_return_routed_experts=True)
+    with patch("abliterix.core.vllm_backend.torch.cuda.device_count", return_value=1):
+        with patch(
+            "abliterix.core.vllm_backend.torch.cuda.is_available", return_value=True
+        ):
+            with patch(
+                "abliterix.core.vllm_backend.torch.cuda.get_device_capability",
+                return_value=(9, 0),
+            ):
+                kwargs = _build_llm_kwargs(
+                    cfg,
+                    model_arch="LlamaForCausalLM",
+                    is_fp8=False,
+                    kv_cache_dtype=None,
+                    lora_max_rank=16,
+                    is_moe=False,
+                )
+    assert kwargs["enable_return_routed_experts"] is True
 
 
 def test_build_llm_kwargs_mla_model_gets_flash_attn_mla():

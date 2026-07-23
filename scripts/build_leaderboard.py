@@ -23,6 +23,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from abliterix.eval.benchmark_result import load_benchmark_results
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
 README_PATH = REPO_ROOT / "README.md"
@@ -39,30 +41,26 @@ REQUIRED_KEYS = (
     "tier",
     "refusal_rate_total",
     "over_refusal_rate_total",
-    "kl_vs_base",
+    "damage_metric",
     "degenerate_rate",
     "mean_response_length",
 )
 
 
 def _load_results() -> list[dict[str, Any]]:
+    report = load_benchmark_results(RESULTS_DIR)
+    for issue in report.issues:
+        summary = issue.message.splitlines()[0]
+        print(
+            f"warning: skipping {issue.source.name}: {summary}",
+            file=sys.stderr,
+        )
+
     rows: list[dict[str, Any]] = []
-    if not RESULTS_DIR.exists():
-        return rows
-    for path in sorted(RESULTS_DIR.glob("*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            print(f"warning: skipping {path.name}: {exc}", file=sys.stderr)
-            continue
-        missing = [k for k in REQUIRED_KEYS if k not in data]
-        if missing:
-            print(
-                f"warning: skipping {path.name}: missing keys {missing}",
-                file=sys.stderr,
-            )
-            continue
-        data["_source"] = path.name
+    for result in report.results:
+        data = result.model_dump(mode="json")
+        if result.source is not None:
+            data["_source"] = result.source.name
         rows.append(data)
     return rows
 
@@ -71,7 +69,7 @@ def _sort_key(row: dict[str, Any]) -> tuple[float, float, float, float]:
     """Composite leaderboard ordering — every component lower-is-better."""
     return (
         float(row["refusal_rate_total"]),
-        float(row["kl_vs_base"]),
+        float(row["damage_metric"]["value"]),
         float(row["over_refusal_rate_total"]),
         float(row["degenerate_rate"]),
     )
@@ -115,20 +113,20 @@ def _render_markdown(rows: list[dict[str, Any]]) -> str:
                 tier=_tier_badge(row["tier"]),
                 ref=_fmt_pct(row["refusal_rate_total"]),
                 orr=_fmt_pct(row["over_refusal_rate_total"]),
-                kl=_fmt_kl(row["kl_vs_base"]),
+                kl=_fmt_kl(row["damage_metric"]["value"]),
                 deg=_fmt_pct(row["degenerate_rate"]),
                 lz=f"{float(row.get('length_z_score', 0.0)):.2f}",
             )
         )
     footer = (
-        "\n_Sorted by `refusal_rate_total` ↑, then `kl_vs_base` ↓, then "
+        "\n_Sorted by `refusal_rate_total` ↑, then full-distribution KL ↓, then "
         "`over_refusal_rate_total` ↓, then `degenerate_rate` ↓. "
         "See [benchmarks/SPEC.md](benchmarks/SPEC.md) for the full contract._\n"
     )
     return header + "\n".join(body_lines) + "\n" + footer
 
 
-def _splice_into_readme(table_md: str) -> bool:
+def _splice_into_readme(table_md: str, *, write: bool = True) -> bool:
     """Replace the BENCH:START/END block in README.md. Returns True on change."""
     text = README_PATH.read_text(encoding="utf-8")
     if BENCH_START not in text or BENCH_END not in text:
@@ -142,7 +140,8 @@ def _splice_into_readme(table_md: str) -> bool:
     new_text = pre + new_block + post
     if new_text == text:
         return False
-    README_PATH.write_text(new_text, encoding="utf-8")
+    if write:
+        README_PATH.write_text(new_text, encoding="utf-8")
     return True
 
 
@@ -157,28 +156,43 @@ def main() -> int:
 
     rows = _load_results()
     table_md = _render_markdown(rows)
-
-    LEADERBOARD_JSON.parent.mkdir(parents=True, exist_ok=True)
-    LEADERBOARD_JSON.write_text(
+    leaderboard_text = (
         json.dumps(
             sorted(rows, key=_sort_key),
             indent=2,
             ensure_ascii=False,
         )
-        + "\n",
-        encoding="utf-8",
+        + "\n"
     )
+
+    if args.check:
+        leaderboard_changed = (
+            not LEADERBOARD_JSON.exists()
+            or LEADERBOARD_JSON.read_text(encoding="utf-8") != leaderboard_text
+        )
+        readme_changed = _splice_into_readme(table_md, write=False)
+        if leaderboard_changed or readme_changed:
+            changed = []
+            if leaderboard_changed:
+                changed.append("benchmarks/leaderboard.json")
+            if readme_changed:
+                changed.append("README.md")
+            print(
+                "error: --check found stale generated output: " + ", ".join(changed),
+                file=sys.stderr,
+            )
+            return 1
+        print("leaderboard outputs are up to date")
+        return 0
+
+    LEADERBOARD_JSON.parent.mkdir(parents=True, exist_ok=True)
+    LEADERBOARD_JSON.write_text(leaderboard_text, encoding="utf-8")
     print(f"wrote {LEADERBOARD_JSON.relative_to(REPO_ROOT)} ({len(rows)} rows)")
 
-    changed = _splice_into_readme(table_md)
-    if changed:
+    if _splice_into_readme(table_md):
         print("README.md leaderboard block updated")
     else:
         print("README.md leaderboard block unchanged")
-
-    if args.check and changed:
-        print("error: --check supplied and README would change", file=sys.stderr)
-        return 1
     return 0
 
 

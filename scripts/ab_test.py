@@ -24,7 +24,6 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import torch
-import torch.nn.functional as F
 from rich.console import Console
 from rich.table import Table
 
@@ -35,6 +34,16 @@ N_EVAL = 100
 MAX_GEN_TOKENS = 150
 BATCH_SIZE = 8
 STRENGTHS = [0.5, 0.8, 1.0, 1.2, 1.5, 2.0]
+
+
+def _clone_method_config(config):
+    """Return an isolated config for one A/B method.
+
+    Pydantic's default ``model_copy()`` is shallow, so mutating a nested
+    steering setting on one method otherwise changes every method assembled
+    from the same root config.
+    """
+    return config.model_copy(deep=True)
 
 
 def main():
@@ -55,6 +64,7 @@ def main():
     from abliterix.core.steering import apply_steering
     from abliterix.types import SteeringProfile
     from abliterix.data import load_prompt_dataset
+    from abliterix.eval.scorer import _safe_kl_divergence
     from abliterix.util import chunk_batches
 
     config = AbliterixConfig(
@@ -137,9 +147,7 @@ def main():
         for batch in chunk_batches(benign_eval, BATCH_SIZE):
             parts.append(engine.compute_logprobs(batch))
         steered = torch.cat(parts, dim=0)
-        kl = F.kl_div(
-            steered, baseline_logprobs, log_target=True, reduction="batchmean"
-        ).item()
+        kl = _safe_kl_divergence(steered, baseline_logprobs)
 
         # Refusals
         responses = []
@@ -159,7 +167,7 @@ def main():
         benign_states, target_states, VectorMethod.MEAN, True
     )
     t_a = time.perf_counter() - t0
-    config_a = config.model_copy()
+    config_a = _clone_method_config(config)
     methods["A: Baseline\n(mean+ortho)"] = (vectors_a, config_a, None, None, t_a)
 
     # B: Projected abliteration + winsorize
@@ -174,13 +182,13 @@ def main():
         winsorize=True,
     )
     t_b = time.perf_counter() - t0
-    config_b = config.model_copy()
+    config_b = _clone_method_config(config)
     config_b.steering.projected_abliteration = True
     methods["B: Projected\n(mean+proj+win)"] = (vectors_b, config_b, None, None, t_b)
 
     # C: Discriminative layers
     console.rule("[bold magenta]C: Disc. layers (mean+ortho+disc)")
-    config_c = config.model_copy()
+    config_c = _clone_method_config(config)
     config_c.steering.discriminative_layer_selection = True
     methods["C: Disc. layers\n(mean+ortho+disc)"] = (
         vectors_a,
@@ -204,7 +212,7 @@ def main():
         sra_ridge_alpha=0.01,
     )
     t_d = time.perf_counter() - t0
-    config_d = config.model_copy()
+    config_d = _clone_method_config(config)
     config_d.steering.projected_abliteration = True
     config_d.steering.discriminative_layer_selection = True
     methods["D: SRA\n(sra+proj+disc)"] = (
@@ -217,7 +225,7 @@ def main():
 
     # E: Spherical steering
     console.rule("[bold red]E: Spherical (mean+ortho+spherical+disc)")
-    config_e = config.model_copy()
+    config_e = _clone_method_config(config)
     config_e.steering.steering_mode = SteeringMode.SPHERICAL
     config_e.steering.discriminative_layer_selection = True
     methods["E: Spherical\n(mean+ortho+sph+disc)"] = (
@@ -244,7 +252,7 @@ def main():
     )
     t_f = time.perf_counter() - t0
     engine._concept_scorers = concept_scorers
-    config_f = config.model_copy()
+    config_f = _clone_method_config(config)
     config_f.steering.steering_mode = SteeringMode.VECTOR_FIELD
     config_f.steering.discriminative_layer_selection = True
     methods["F: SVF\n(mean+ortho+svf+disc)"] = (
@@ -257,7 +265,7 @@ def main():
 
     # G: Full new architecture (SRA + spherical + disc + projected)
     console.rule("[bold white]G: Full new arch (SRA+sph+disc+proj)")
-    config_g = config.model_copy()
+    config_g = _clone_method_config(config)
     config_g.steering.steering_mode = SteeringMode.SPHERICAL
     config_g.steering.projected_abliteration = True
     config_g.steering.discriminative_layer_selection = True

@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "accelerate~=1.10",
-    "bitsandbytes~=0.45",
+    "bitsandbytes~=0.45; sys_platform != 'darwin' or platform_machine != 'arm64'",
     "datasets~=4.0",
     "hf-transfer~=0.1",
     "huggingface-hub~=1.6",
@@ -87,6 +87,9 @@ Changelog = "https://github.com/wuwangzhang1216/abliterix/releases"
 abliterix = "abliterix.cli:main"
 abliterix-dequant-fp8 = "abliterix.scripts.dequant_fp8:main"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [build-system]
 requires = ["uv_build>=0.8.11,<0.9.0"]
 build-backend = "uv_build"
@@ -122,6 +125,6 @@ unused-ignore-comment = "ignore"
 # Pydantic-settings BaseSettings fields are populated via env/CLI/TOML at
 # runtime; ty cannot see that and reports `missing-argument` on direct calls
 # in helper code. The same dynamic attribute population also confuses
-# `not-subscriptable` checks against engine objects.
+# `non-subscriptable` checks against engine objects.
 missing-argument = "ignore"
-not-subscriptable = "ignore"
+non-subscriptable = "ignore"

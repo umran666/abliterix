@@ -34,6 +34,12 @@ MoEBackend = Literal[
     "emulation",
 ]
 
+# vLLM's Punica kernels only accept these configured maximum ranks.  Smaller
+# adapters may be zero-padded to one of these capacities at serialisation time,
+# but passing any other ``max_lora_rank`` makes engine startup fail deep inside
+# vLLM.  Keep this list in sync with vLLM's LoRAConfig validator.
+VLLM_SUPPORTED_LORA_RANKS = frozenset({1, 8, 16, 32, 64, 128, 256, 320, 512})
+
 # CompileMode is owned by vllm_compilation_config; settings re-uses the
 # same Literal so a typo (e.g. "eagar") is caught at config-load instead
 # of inside vllm_compilation_config.build().
@@ -214,10 +220,12 @@ class ModelConfig(BaseModel):
         ),
     )
 
-    enable_expert_parallel: bool = Field(
-        default=True,
+    enable_expert_parallel: bool | None = Field(
+        default=None,
         description=(
-            "Enable expert parallelism (EP) for MoE models in vLLM.  "
+            "Enable expert parallelism (EP) for MoE models in vLLM. None "
+            "(default) enables it only when the loaded topology is MoE. "
+            "True forces EP for a known MoE model; False disables it. "
             "EP distributes experts across GPUs rather than replicating them.  "
             "Best for models with >3% expert activation density (DeepSeek, Qwen MoE)."
         ),
@@ -384,10 +392,9 @@ class ModelConfig(BaseModel):
     vllm_max_lora_rank: int | None = Field(
         default=None,
         description=(
-            "vLLM ``max_lora_rank``.  None (default) lets vLLM use its own "
-            "default (16 in 0.20.x).  Set to the smallest value that fits "
-            "every adapter you plan to load — abliterix used to force-pad "
-            "to 8, but vLLM accepts arbitrary ranks now."
+            "vLLM ``max_lora_rank``. None (default) uses rank 1, matching "
+            "Abliterix's ProjectionCache adapters and avoiding zero-padding. "
+            "Set this explicitly for any external or future rank-k adapter."
         ),
     )
 
@@ -404,11 +411,13 @@ class ModelConfig(BaseModel):
         ),
     )
 
-    vllm_return_routed_experts: bool = Field(
-        default=True,
+    vllm_return_routed_experts: bool | None = Field(
+        default=None,
         description=(
             "Pass-through for vLLM's ``enable_return_routed_experts`` (vLLM "
-            "0.20.x+). When True (default), abliterix's MoE safety-expert "
+            "0.20.x+). None (default) enables capture only when the loaded "
+            "Hugging Face config describes a MoE architecture; explicit True "
+            "or False always wins. When enabled, abliterix's MoE safety-expert "
             "profiler reads per-token routing IDs directly from "
             "``RequestOutput.outputs[0].routed_experts`` instead of "
             "installing forward hooks via ``collective_rpc``. This removes "
@@ -459,6 +468,18 @@ class ModelConfig(BaseModel):
                 "lora_target_modules is set but disable_lora=True — the "
                 "target list would be silently dropped because LoRA is off. "
                 "Either unset lora_target_modules or set disable_lora=false."
+            )
+        if (
+            self.vllm_max_lora_rank is not None
+            and self.vllm_max_lora_rank not in VLLM_SUPPORTED_LORA_RANKS
+        ):
+            supported = ", ".join(
+                str(rank) for rank in sorted(VLLM_SUPPORTED_LORA_RANKS)
+            )
+            raise ValueError(
+                f"vllm_max_lora_rank={self.vllm_max_lora_rank} is not supported "
+                f"by vLLM; choose one of {{{supported}}}. Smaller adapters are "
+                "safely zero-padded to the configured supported rank."
             )
         return self
 
@@ -1903,6 +1924,70 @@ class AbliterixConfig(BaseSettings):
                 "iterative.per_iteration_directions for its own multi-vector "
                 "extraction and ignores the harmfulness flag. Choose one."
             )
+
+        rank_k_recipe = bool(
+            self.steering.n_directions > 1
+            or self.steering.ablate_harmfulness_direction
+            or self.steering.search_harmfulness_direction
+            or self.steering.vector_method in (VectorMethod.SOM, VectorMethod.SAE)
+            or self.iterative.enabled
+        )
+        runtime_hook_modes = {
+            SteeringMode.ANGULAR,
+            SteeringMode.ADAPTIVE_ANGULAR,
+            SteeringMode.SPHERICAL,
+            SteeringMode.VECTOR_FIELD,
+        }
+        if rank_k_recipe and self.steering.steering_mode in runtime_hook_modes:
+            raise ValueError(
+                "Rank-k steering recipes are not implemented for runtime hook "
+                f"mode {self.steering.steering_mode.value!r}; use steering_mode="
+                "'lora' or dense steering_mode='direct'."
+            )
+        if rank_k_recipe and self.steering.steering_mode == SteeringMode.DIRECT:
+            if (
+                self.steering.direct_transform != DirectTransform.STANDARD
+                or self.steering.search_direct_transform
+            ):
+                raise ValueError(
+                    "Rank-k direct steering currently implements the standard "
+                    "QR subspace projection only. A non-standard or searched "
+                    "direct_transform would be ignored; use direct_transform="
+                    "'standard' or steering_mode='lora'."
+                )
+
+        # The current vLLM fast path materialises one rank-1 adapter from a
+        # ProjectionCache.  Feeding it a stacked ``(rank, layers, hidden)``
+        # tensor either indexes the layer axis as the rank axis or silently
+        # reuses the cache built for the single vector.  Reject every known
+        # producer of that layout until ProjectionCache itself is rank-k aware.
+        if self.model.backend == "vllm":
+            unsupported: list[str] = []
+            if self.steering.n_directions > 1:
+                unsupported.append(f"n_directions={self.steering.n_directions}")
+            if self.steering.ablate_harmfulness_direction:
+                unsupported.append("ablate_harmfulness_direction=true")
+            if self.steering.search_harmfulness_direction:
+                unsupported.append("search_harmfulness_direction=true")
+            if self.steering.vector_method == VectorMethod.SOM:
+                unsupported.append("vector_method='som'")
+            if self.steering.vector_method == VectorMethod.SAE:
+                unsupported.append("vector_method='sae'")
+            if self.steering.weight_normalization == WeightNorm.FULL:
+                unsupported.append("weight_normalization='full'")
+            if self.iterative.enabled:
+                unsupported.append("iterative.enabled=true")
+
+            if unsupported:
+                details = ", ".join(unsupported)
+                raise ValueError(
+                    "backend='vllm' currently uses ProjectionCache, which "
+                    "supports only a 2-D single-direction rank-1 steering "
+                    f"tensor. Unsupported rank-k recipe settings: {details}. "
+                    "Use backend='hf' for this recipe. Setting "
+                    "vllm_max_lora_rank only changes vLLM kernel capacity; it "
+                    "does not make ProjectionCache rank-k aware."
+                )
         return self
 
     @classmethod

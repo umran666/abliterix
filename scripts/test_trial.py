@@ -34,7 +34,13 @@ import argparse
 import os
 import sys
 
-from abliterix.scriptlib import extract_trial_params, load_trial, setup_io
+from abliterix.scriptlib import (
+    apply_trial_artifact,
+    compute_trial_vectors,
+    extract_trial_artifact,
+    load_trial,
+    setup_io,
+)
 
 setup_io()
 
@@ -111,11 +117,13 @@ def main():
     from abliterix.settings import AbliterixConfig
     from abliterix.types import ChatMessage
     from abliterix.util import flush_memory
-    from abliterix.vectors import compute_steering_vectors
 
     # Load trial
     trial = load_trial(args.checkpoint, args.model, args.trial)
-    direction_index, parameters, routing = extract_trial_params(trial)
+    artifact = extract_trial_artifact(trial)
+    direction_index = artifact.vector_index
+    parameters = artifact.profiles
+    routing = artifact.routing
 
     kl = trial.user_attrs.get("kl_divergence")
     refusals = trial.user_attrs.get("refusals")
@@ -123,6 +131,7 @@ def main():
 
     # Load model
     config = AbliterixConfig()
+    apply_trial_artifact(config, artifact)
     engine = SteeringEngine(config)
 
     # Compute steering vectors
@@ -131,14 +140,7 @@ def main():
     target = load_prompt_dataset(config, config.target_prompts)
     benign_states = engine.extract_hidden_states_batched(benign)
     target_states = engine.extract_hidden_states_batched(target)
-    vectors = compute_steering_vectors(
-        benign_states,
-        target_states,
-        config.steering.vector_method,
-        config.steering.orthogonal_projection,
-    )
-    del benign_states, target_states
-    flush_memory()
+    vectors = compute_trial_vectors(artifact, benign_states, target_states, config)
 
     # Profile MoE experts if applicable
     safety_experts = None
@@ -179,7 +181,11 @@ def main():
         config,
         safety_experts=safety_experts,
         routing_config=routing,
+        benign_states=benign_states,
+        target_states=target_states,
     )
+    del benign_states, target_states
+    flush_memory()
 
     print(f"\n{SEP}\nABLITERATED (Trial #{args.trial}):\n{SEP}")
     for msg in messages:

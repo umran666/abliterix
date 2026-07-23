@@ -119,29 +119,88 @@ def _extract_multi_directions(
     target_states: Tensor,
     n_directions: int = 3,
 ) -> Tensor:
-    """Extract top-k independent refusal directions via SVD.
+    """Extract a mean refusal direction plus residual SVD directions.
 
-    Instead of a single mean-difference vector, decomposes the refusal
-    subspace into multiple orthogonal components.  The returned tensor has
-    shape ``(n_directions, layers+1, hidden_dim)`` — each slice is a
-    unit-normalised direction.
+    Direction zero is the normalised target-minus-benign mean, matching the
+    single-direction ``MEAN`` contract.  Remaining directions come from the
+    centred per-sample differences and are orthogonalised against the mean
+    and all earlier residual directions.  The returned tensor has shape
+    ``(n_directions, layers+1, hidden_dim)``.  Degenerate directions are zero;
+    every other direction has unit norm per layer.
     """
     n_layers = benign_states.shape[1]
-    all_dirs = []
+    per_layer_directions = []
 
-    for k in range(n_directions):
-        per_layer = []
-        for layer_idx in range(n_layers):
-            diff = (
-                target_states[:, layer_idx, :].float()
-                - benign_states[:, layer_idx, :].float()
+    for layer_idx in range(n_layers):
+        target = target_states[:, layer_idx, :].float()
+        benign = benign_states[:, layer_idx, :].float()
+        diff = target - benign
+        mean_diff = target.mean(dim=0) - benign.mean(dim=0)
+        mean_direction = F.normalize(mean_diff, p=2, dim=0)
+        layer_directions = [mean_direction]
+
+        residual = diff - mean_diff.unsqueeze(0)
+        residual = residual - (
+            (residual @ mean_direction).unsqueeze(1) * mean_direction.unsqueeze(0)
+        )
+        _, singular_values, Vh = torch.linalg.svd(residual, full_matrices=False)
+        if singular_values.numel():
+            tolerance = (
+                torch.finfo(residual.dtype).eps
+                * max(residual.shape)
+                * singular_values[0]
             )
-            diff = diff - diff.mean(dim=0, keepdim=True)
-            _, _, Vh = torch.linalg.svd(diff, full_matrices=False)
-            per_layer.append(Vh[k] if k < Vh.shape[0] else torch.zeros_like(Vh[0]))
-        all_dirs.append(F.normalize(torch.stack(per_layer, dim=0), p=2, dim=1))
+        else:
+            tolerance = torch.tensor(0.0, device=residual.device)
 
-    return torch.stack(all_dirs, dim=0)
+        for residual_idx in range(n_directions - 1):
+            if (
+                residual_idx >= Vh.shape[0]
+                or singular_values[residual_idx] <= tolerance
+            ):
+                direction = torch.zeros_like(mean_diff)
+            else:
+                direction = Vh[residual_idx]
+                for previous in layer_directions:
+                    norm_squared = torch.dot(previous, previous)
+                    if norm_squared > 0:
+                        direction = (
+                            direction
+                            - (torch.dot(direction, previous) / norm_squared) * previous
+                        )
+                direction = F.normalize(direction, p=2, dim=0)
+            layer_directions.append(direction)
+
+        per_layer_directions.append(torch.stack(layer_directions, dim=0))
+
+    return torch.stack(per_layer_directions, dim=1)
+
+
+def _orthonormalize_direction_rows(directions: Tensor) -> Tensor:
+    """Rebuild an orthonormal per-layer basis while preserving zero rows."""
+    result = torch.zeros_like(directions, dtype=torch.float32)
+    tolerance = torch.finfo(result.dtype).eps * max(
+        directions.shape[0], directions.shape[2]
+    )
+
+    for layer_idx in range(directions.shape[1]):
+        for direction_idx in range(directions.shape[0]):
+            direction = directions[direction_idx, layer_idx].float().clone()
+            if torch.linalg.vector_norm(direction) <= tolerance:
+                continue
+
+            # Re-orthogonalised modified Gram-Schmidt is more stable than a
+            # single classical pass and, unlike QR, keeps degenerate row slots.
+            for _ in range(2):
+                for previous_idx in range(direction_idx):
+                    previous = result[previous_idx, layer_idx]
+                    direction = direction - torch.dot(direction, previous) * previous
+
+            norm = torch.linalg.vector_norm(direction)
+            if norm > tolerance:
+                result[direction_idx, layer_idx] = direction / norm
+
+    return result.to(directions.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +316,17 @@ def compute_steering_vectors(
         directions = _extract_multi_directions(
             benign_states, target_states, n_directions
         )
+        if winsorize:
+            original_shape = directions.shape
+            flattened = directions.reshape(-1, original_shape[-1])
+            flattened = torch.stack(
+                [
+                    _winsorize(direction, quantile=winsorize_quantile)
+                    for direction in flattened
+                ],
+                dim=0,
+            )
+            directions = F.normalize(flattened, p=2, dim=1).reshape(original_shape)
         # Apply projection to each direction independently.
         if projected_abliteration or orthogonal_projection:
             benign_mean = benign_states.mean(dim=0)
@@ -271,8 +341,8 @@ def compute_steering_vectors(
                     proj_scalar = torch.sum(v * benign_dir, dim=1, keepdim=True)
                     v = v - proj_scalar * benign_dir
                 projected.append(F.normalize(v, p=2, dim=1))
-            return torch.stack(projected, dim=0)
-        return directions
+            directions = torch.stack(projected, dim=0)
+        return _orthonormalize_direction_rows(directions)
 
     # --- Single-direction methods ---
 
@@ -415,6 +485,44 @@ def compute_steering_vectors(
         vectors = F.normalize(vectors, p=2, dim=1)
 
     return vectors
+
+
+def compute_configured_steering_vectors(
+    benign_states: Tensor,
+    target_states: Tensor,
+    config,
+) -> Tensor:
+    """Compute vectors from the complete, replayable steering recipe.
+
+    CLI and export scripts previously maintained separate, incomplete keyword
+    lists.  Keeping the mapping here makes a saved trial use the same vector
+    implementation during optimisation, inspection, and export.
+    """
+    steering = config.steering
+    return compute_steering_vectors(
+        benign_states,
+        target_states,
+        steering.vector_method,
+        steering.orthogonal_projection,
+        winsorize=steering.winsorize_vectors,
+        winsorize_quantile=steering.winsorize_quantile,
+        projected_abliteration=steering.projected_abliteration,
+        ot_components=steering.ot_components,
+        n_directions=steering.n_directions,
+        sra_base_method=steering.sra_base_method,
+        sra_n_atoms=steering.sra_n_atoms,
+        sra_ridge_alpha=steering.sra_ridge_alpha,
+        ablate_harmfulness_direction=steering.ablate_harmfulness_direction,
+        harmfulness_layer_band=tuple(steering.harmfulness_layer_band),
+        som_grid_h=steering.som_grid_h,
+        som_grid_w=steering.som_grid_w,
+        som_n_iters=steering.som_n_iters,
+        som_initial_lr=steering.som_initial_lr,
+        som_seed=steering.som_seed,
+        sae_path=steering.sae_path,
+        sae_layer=steering.sae_layer,
+        sae_top_k=steering.sae_top_k,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -53,6 +53,10 @@ class UISession:
     study: object | None = None
     steering_vectors: object | None = None
     safety_experts: dict | None = None
+    benign_states: object | None = None
+    target_states: object | None = None
+    selected_trial: object | None = None
+    trial_config: object | None = None
     is_running: bool = False
     should_stop: bool = False
     log_lines: list[str] = field(default_factory=list)
@@ -119,13 +123,15 @@ def _run_optimisation(
     from .optimizer import run_search
     from .settings import AbliterixConfig
     from .types import SteeringMode as SM
-    from .vectors import compute_steering_vectors
+    from .vectors import compute_configured_steering_vectors
 
     with _session.lock:
         _session.is_running = True
         _session.should_stop = False
         _session.log_lines = []
         _session.trial_data = []
+        _session.selected_trial = None
+        _session.trial_config = None
 
     def _log(msg: str):
         with _session.lock:
@@ -162,6 +168,22 @@ def _run_optimisation(
 
         _session.config = config
 
+        unsupported_ui: list[str] = []
+        if config.model.backend != "hf":
+            unsupported_ui.append(f"backend={config.model.backend!r}")
+        if config.iterative.enabled:
+            unsupported_ui.append("iterative.enabled=true")
+        if config.steering.cliff_head_ablation:
+            unsupported_ui.append("cliff_head_ablation=true")
+        if config.steering.search_harmfulness_direction:
+            unsupported_ui.append("search_harmfulness_direction=true")
+        if unsupported_ui:
+            raise ValueError(
+                "The Web UI does not yet implement these execution paths: "
+                + ", ".join(unsupported_ui)
+                + ". Use the CLI so the requested method cannot be silently skipped."
+            )
+
         # Suppress noisy libraries.
         torch.set_grad_enabled(False)
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -183,31 +205,12 @@ def _run_optimisation(
         _log("Extracting hidden states...")
         benign_states = engine.extract_hidden_states_batched(benign_msgs)
         target_states = engine.extract_hidden_states_batched(target_msgs)
+        _session.benign_states = benign_states
+        _session.target_states = target_states
 
         _log(f"Computing steering vectors ({vector_method})...")
-        vectors = compute_steering_vectors(
-            benign_states,
-            target_states,
-            config.steering.vector_method,
-            config.steering.orthogonal_projection,
-            winsorize=config.steering.winsorize_vectors,
-            winsorize_quantile=config.steering.winsorize_quantile,
-            projected_abliteration=config.steering.projected_abliteration,
-            ot_components=config.steering.ot_components,
-            n_directions=config.steering.n_directions,
-            sra_base_method=config.steering.sra_base_method,
-            sra_n_atoms=config.steering.sra_n_atoms,
-            sra_ridge_alpha=config.steering.sra_ridge_alpha,
-            ablate_harmfulness_direction=config.steering.ablate_harmfulness_direction,
-            harmfulness_layer_band=tuple(config.steering.harmfulness_layer_band),
-            som_grid_h=config.steering.som_grid_h,
-            som_grid_w=config.steering.som_grid_w,
-            som_n_iters=config.steering.som_n_iters,
-            som_initial_lr=config.steering.som_initial_lr,
-            som_seed=config.steering.som_seed,
-            sae_path=config.steering.sae_path,
-            sae_layer=config.steering.sae_layer,
-            sae_top_k=config.steering.sae_top_k,
+        vectors = compute_configured_steering_vectors(
+            benign_states, target_states, config
         )
         _session.steering_vectors = vectors
 
@@ -278,7 +281,29 @@ def _run_optimisation(
             progress_callback=_progress_callback,
         )
         _session.study = study
-        _log("Optimisation complete!")
+        completed = [
+            trial
+            for trial in study.trials
+            if trial.user_attrs.get("refusals") is not None
+            and trial.user_attrs.get("kl_divergence") is not None
+        ]
+        if not completed:
+            raise RuntimeError("Optimisation produced no completed replayable trial")
+        selected = min(
+            completed,
+            key=lambda trial: (
+                trial.user_attrs["refusals"],
+                trial.user_attrs["kl_divergence"],
+                trial.number,
+            ),
+        )
+        _session.selected_trial = selected
+        _restore_session_trial()
+        _log(
+            "Optimisation complete! Selected trial "
+            f"{selected.user_attrs.get('index', selected.number)} "
+            "(fewest refusals, then lowest KL)."
+        )
 
         detector.close()
 
@@ -287,6 +312,31 @@ def _run_optimisation(
     finally:
         with _session.lock:
             _session.is_running = False
+
+
+def _restore_session_trial():
+    """Replay the selected Web UI trial with its complete saved semantics."""
+    if (
+        _session.selected_trial is None
+        or _session.config is None
+        or _session.engine is None
+        or _session.steering_vectors is None
+    ):
+        raise RuntimeError("No completed trial is selected for replay")
+
+    from .interactive import _restore_selected_trial
+
+    trial_config = _restore_selected_trial(
+        _session.selected_trial,
+        _session.config,
+        _session.engine,
+        _session.steering_vectors,
+        _session.safety_experts,
+        benign_states=_session.benign_states,
+        target_states=_session.target_states,
+    )
+    _session.trial_config = trial_config
+    return trial_config
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +556,7 @@ def _build_ui() -> gr.Blocks:
                     steered_output = gr.Textbox(label="Steered Response", lines=10)
 
                 def run_comparison(prompt):
-                    if _session.engine is None:
+                    if _session.engine is None or _session.selected_trial is None:
                         return "No model loaded", "No model loaded"
 
                     engine = _session.engine
@@ -521,22 +571,9 @@ def _build_ui() -> gr.Blocks:
                     engine.restore_baseline()
                     baseline = engine.generate_text([msg])[0]
 
-                    # Steered (re-apply steering).
-                    if (
-                        _session.steering_vectors is not None
-                        and _session.config is not None
-                    ):
-                        from .core.steering import apply_steering
-
-                        # Use best trial parameters if available.
-                        apply_steering(
-                            engine,
-                            _session.steering_vectors,
-                            vector_index=None,
-                            profiles={},
-                            config=_session.config,
-                        )
-
+                    # Steered: replay the selected trial's actual profiles,
+                    # vector variant, transform, routing, and layer selection.
+                    _restore_session_trial()
                     steered = engine.generate_text([msg])[0]
                     return baseline, steered
 
@@ -557,7 +594,7 @@ def _build_ui() -> gr.Blocks:
                     clear_btn = gr.Button("Clear")
 
                 def chat_respond(message, history):
-                    if _session.engine is None:
+                    if _session.engine is None or _session.selected_trial is None:
                         history.append({"role": "user", "content": message})
                         history.append(
                             {
@@ -566,6 +603,8 @@ def _build_ui() -> gr.Blocks:
                             }
                         )
                         return history, ""
+
+                    _restore_session_trial()
 
                     from .types import ChatMessage
 
@@ -606,9 +645,14 @@ def _build_ui() -> gr.Blocks:
                 upload_status = gr.Textbox(label="Upload Status", interactive=False)
 
                 def save_model(path):
-                    if not _session.engine or not path:
+                    if (
+                        not _session.engine
+                        or _session.selected_trial is None
+                        or not path
+                    ):
                         return "No model loaded or path empty"
                     try:
+                        _restore_session_trial()
                         merged = _session.engine.export_merged()
                         merged.save_pretrained(path)
                         _session.engine.tokenizer.save_pretrained(path)
@@ -617,9 +661,14 @@ def _build_ui() -> gr.Blocks:
                         return f"Error: {e}"
 
                 def upload_model(repo_id, private):
-                    if not _session.engine or not repo_id:
+                    if (
+                        not _session.engine
+                        or _session.selected_trial is None
+                        or not repo_id
+                    ):
                         return "No model loaded or repo ID empty"
                     try:
+                        _restore_session_trial()
                         merged = _session.engine.export_merged()
                         merged.push_to_hub(repo_id, private=private)
                         _session.engine.tokenizer.push_to_hub(repo_id, private=private)

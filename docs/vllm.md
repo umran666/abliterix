@@ -3,9 +3,14 @@
 # vLLM Runbook
 
 This note records the production lessons from the Gemma 4 31B trial-40 run.
-The default posture for large models should be **vLLM-first**. Do not go back
+The default posture for multi-GPU or large-model runs should be **vLLM-first**. Do not go back
 to HuggingFace generation/evaluation for trial loops unless there is a specific
 backend blocker.
+
+For a small model on one GPU, benchmark both backends. On an RTX 5090 with
+Qwen2.5-1.5B, batch 64 and three KL tokens, HF took 0.16 s versus 0.40 s for
+the vectorized vLLM path; vLLM's scheduler and CPU logprob materialization do
+not pay for themselves at that scale.
 
 ## Rule Of Thumb
 
@@ -172,14 +177,25 @@ weight-edit behavior.
 After selecting a winning trial, export once with HF so the Hugging Face repo
 contains normal safetensors:
 
+Create an HF twin of the optimization config (`backend = "hf"` and no vLLM
+in-place settings) and pass that file to the export script. Passing the
+original vLLM config is rejected: ProjectionCache/in-place execution is not
+automatically equivalent to HF materialization for every transform.
+
 ```bash
 /workspace/venvs/abliterix-vllm/bin/python scripts/export_model.py \
   --model google/gemma-4-31B-it \
   --checkpoint /workspace/checkpoints_gemma4_31b_vllm_inplace \
   --trial 40 \
-  --config configs/gemma4_31b.toml \
+  --config configs/gemma4_31b_export_hf.toml \
   --save-local /workspace/export_gemma4_31b_trial40
 ```
+
+For an HF LoRA trial, add `--format adapter` to preserve the live dynamic
+adapter exactly. A merged BF16 checkpoint is more convenient, but a 5090
+acceptance test measured a small merge-only drift (top-1 remained 100%, KL was
+about 4.5e-4). Adapter export deliberately rejects direct/router/expert edits,
+which PEFT files cannot represent.
 
 Do not use the generic `upload_model.py` model card for Gemma 4 releases. Write
 the README explicitly from the prior model card style and include:
@@ -274,10 +290,11 @@ Three abliterix-level intents map onto vLLM's `compilation_config` dict:
 
 ```toml
 [model]
-vllm_return_routed_experts = true  # default
+vllm_return_routed_experts = true  # optional explicit override
 ```
 
-When on (default), abliterix's MoE safety-expert profiler reads per-token
+The default is `None`/auto: Abliterix enables this only when the loaded HF
+config describes a MoE topology. When enabled, the safety-expert profiler reads per-token
 routing IDs directly from `RequestOutput.outputs[0].routed_experts`
 (numpy ndarray of shape `(prompt_tokens, n_layers, top_k)`). This
 replaces the previous `collective_rpc` + forward-hook probe pipeline
@@ -302,19 +319,33 @@ This removed one of the two reasons abliterix needed
 the env var auto-set logic in `vllm_compat.ensure_vllm_env(needs_collective_rpc=True)`
 is unchanged.
 
+### Expert parallelism is topology-aware
+
+```toml
+[model]
+enable_expert_parallel = true  # optional MoE-only override
+```
+
+The default is `None`/auto. Abliterix enables EP only when the loaded model is
+MoE; passing EP to a dense model makes vLLM fail during config validation.
+Explicit `false` disables EP on MoE models, while explicit `true` on a known
+dense topology is rejected with a clear error.
+
 ### LoRA pool / target modules
 
 ```toml
 [model]
 vllm_max_loras = 1            # adapter slots in CPU; raise to pool trial adapters
-vllm_max_lora_rank = 16       # default 16 (vLLM's own default in 0.20.x)
+vllm_max_lora_rank = 1        # default; Abliterix adapters are rank 1
 lora_target_modules = ["o_proj", "qkv_proj"]  # restrict LoRA to non-MoE
 ```
 
-`vllm_max_lora_rank` defaults to vLLM's own default (16). The prior
-hardcoded floor of 8 is gone — set this to the actual rank you plan to
-use for the cleanest KL signal (no zero-padded dimensions polluting the
-direction).
+`vllm_max_lora_rank` defaults to 1 because ProjectionCache emits rank-1
+updates. vLLM accepts only `{1, 8, 16, 32, 64, 128, 256, 320, 512}` for this
+capacity. Current Abliterix ProjectionCache is still single-direction: setting
+a larger capacity does not enable rank-k recipes. Multi-direction,
+harmfulness-pair, SOM, SAE, iterative, and full-normalization recipes fail
+closed under `backend = "vllm"`; use HF for those methods.
 
 `lora_target_modules` maps to vLLM's `--lora-target-modules` (PR #34984,
 v0.19.0+). Mainly a perf knob; experimentally also a possible workaround

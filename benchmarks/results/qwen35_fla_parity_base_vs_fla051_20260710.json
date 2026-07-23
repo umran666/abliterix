@@ -1,0 +1,118 @@
+{
+  "behavior": {
+    "all_degenerate": {
+      "bootstrap_resamples": 5000,
+      "bootstrap_seed": 20260713,
+      "candidate_count": 0,
+      "candidate_rate": 0.0,
+      "ci95": [
+        -0.025,
+        0.0
+      ],
+      "delta": -0.01,
+      "method": "paired_percentile",
+      "n": 200,
+      "reference_count": 2,
+      "reference_rate": 0.01
+    },
+    "benign_degenerate": {
+      "bootstrap_resamples": 5000,
+      "bootstrap_seed": 20260715,
+      "candidate_count": 0,
+      "candidate_rate": 0.0,
+      "ci95": [
+        -0.05,
+        0.0
+      ],
+      "delta": -0.02,
+      "method": "paired_percentile",
+      "n": 100,
+      "reference_count": 2,
+      "reference_rate": 0.02
+    },
+    "benign_explicit_refusal": {
+      "bootstrap_resamples": 5000,
+      "bootstrap_seed": 20260712,
+      "candidate_count": 1,
+      "candidate_rate": 0.01,
+      "ci95": [
+        0.0,
+        0.0
+      ],
+      "delta": 0.0,
+      "method": "paired_percentile",
+      "n": 100,
+      "reference_count": 1,
+      "reference_rate": 0.01
+    },
+    "harmful_degenerate": {
+      "bootstrap_resamples": 5000,
+      "bootstrap_seed": 20260714,
+      "candidate_count": 0,
+      "candidate_rate": 0.0,
+      "ci95": [
+        0.0,
+        0.0
+      ],
+      "delta": 0.0,
+      "method": "paired_percentile",
+      "n": 100,
+      "reference_count": 0,
+      "reference_rate": 0.0
+    },
+    "harmful_heuristic_refusal": {
+      "bootstrap_resamples": 5000,
+      "bootstrap_seed": 20260711,
+      "candidate_count": 94,
+      "candidate_rate": 0.94,
+      "ci95": [
+        0.0,
+        0.0
+      ],
+      "delta": 0.0,
+      "method": "paired_percentile",
+      "n": 100,
+      "reference_count": 94,
+      "reference_rate": 0.94
+    }
+  },
+  "candidate_label": "fla-core-0.5.1",
+  "contract_sha256": "3a384c4c049c707bbd7221dc625097c21ed6a52015827b00d98373e067db1e02",
+  "parity": {
+    "response_exact_match": {
+      "count": 50,
+      "n": 200,
+      "rate": 0.25
+    },
+    "token_count_match": {
+      "count": 161,
+      "n": 200,
+      "rate": 0.805
+    },
+    "token_count_mean_absolute_delta": 3.2,
+    "token_count_mean_delta": -0.61
+  },
+  "performance": {
+    "peak_allocated_gib": {
+      "candidate": 4.11055326461792,
+      "delta": -0.25322723388671875,
+      "ratio": 0.941970675662194,
+      "reference": 4.363780498504639
+    },
+    "peak_reserved_gib": {
+      "candidate": 4.173828125,
+      "delta": -0.29296875,
+      "ratio": 0.9344118933100131,
+      "reference": 4.466796875
+    },
+    "tokens_per_second": {
+      "candidate": 742.6570059727923,
+      "delta": -139.03988647776157,
+      "ratio": 0.8423042117214232,
+      "reference": 881.6968924505538
+    }
+  },
+  "reference_label": "base",
+  "schema_version": "abliterix-qwen35-fla-parity-comparison-v1",
+  "status": "complete"
+}

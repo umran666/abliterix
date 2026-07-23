@@ -29,8 +29,13 @@ from .reproducibility import (
     repo_weight_shas,
     write_reproduce_artifacts,
 )
+from .scriptlib import (
+    apply_trial_artifact,
+    extract_trial_artifact,
+    select_trial_vectors,
+)
 from .settings import AbliterixConfig
-from .types import QuantMode, SteeringProfile
+from .types import QuantMode
 from .util import (
     ask_choice,
     ask_path,
@@ -324,7 +329,12 @@ def _run_benchmarks(
     engine: SteeringEngine,
     steering_vectors: Tensor,
     trial,
-):
+    safety_experts,
+    *,
+    benign_states: Tensor | None = None,
+    target_states: Tensor | None = None,
+    steering_vector_variants: dict[str, Tensor] | None = None,
+) -> AbliterixConfig | None:
     """Run lm-eval-harness benchmarks on the steered model (optionally vs base).
 
     The decensored model is already applied to ``engine`` by the caller. When
@@ -338,7 +348,7 @@ def _run_benchmarks(
     except ImportError:
         print("[yellow]lm-eval is not installed.[/] Install the benchmark extra:")
         print("    [bold]pip install 'abliterix[bench]'[/]")
-        return
+        return None
 
     raw = ask_text(
         "Comma-separated lm-eval tasks:",
@@ -346,7 +356,7 @@ def _run_benchmarks(
     )
     tasks = [t.strip() for t in raw.split(",") if t.strip()]
     if not tasks:
-        return
+        return None
     limit_raw = ask_text("Max examples per task (blank = full):", default="100")
     limit = int(limit_raw) if limit_raw.strip() else None
 
@@ -370,21 +380,86 @@ def _run_benchmarks(
             pretrained=engine.model, tokenizer=engine.tokenizer, batch_size="auto"
         )
         results_base = simple_evaluate(model=lm_base, tasks=tasks, limit=limit)
-        # Re-apply the selected trial's steering so later menu actions (save,
-        # upload, chat) operate on the decensored model again.
+        # Replay the complete saved recipe so later menu actions (save, upload,
+        # chat) operate on the exact selected model again.
         print("Re-applying steering...")
+        restored_config = _restore_selected_trial(
+            trial,
+            config,
+            engine,
+            steering_vectors,
+            safety_experts,
+            benign_states=benign_states,
+            target_states=target_states,
+            steering_vector_variants=steering_vector_variants,
+        )
+    else:
+        restored_config = None
+
+    _print_lm_eval_table(results_ab, results_base)
+    return restored_config
+
+
+def _restore_selected_trial(
+    trial,
+    config: AbliterixConfig,
+    engine: SteeringEngine,
+    steering_vectors: Tensor,
+    safety_experts,
+    *,
+    benign_states: Tensor | None = None,
+    target_states: Tensor | None = None,
+    steering_vector_variants: dict[str, Tensor] | None = None,
+) -> AbliterixConfig:
+    """Replay a selected trial without mutating the search configuration.
+
+    The trial recipe is restored on a deep config copy so selecting a trial
+    cannot change the semantics of a subsequent ``Run additional trials``.
+    Variant reconstruction deliberately happens before touching the model;
+    missing residuals therefore fail loudly while the baseline is intact.
+    """
+    artifact = extract_trial_artifact(trial)
+    trial_config = config.model_copy(deep=True)
+    apply_trial_artifact(trial_config, artifact)
+
+    # Prefer the exact single-vector tensor supplied to the optimiser when a
+    # variant map is available. Multi-direction variants are reconstructed by
+    # select_trial_vectors from the retained residuals, which also validates
+    # that the artifact names a supported method.
+    default_vectors = steering_vectors
+    if steering_vector_variants is not None:
+        default_vectors = steering_vector_variants.get("single", default_vectors)
+    trial_vectors = select_trial_vectors(
+        artifact,
+        default_vectors,
+        benign_states=benign_states,
+        target_states=target_states,
+        config=trial_config,
+    )
+
+    previous_config = engine.config
+    engine.config = trial_config
+    try:
         engine.restore_baseline()
         apply_steering(
             engine,
-            steering_vectors,
-            trial.user_attrs["vector_index"],
-            {
-                k: SteeringProfile(**v)
-                for k, v in trial.user_attrs["parameters"].items()
-            },
+            trial_vectors,
+            artifact.vector_index,
+            artifact.profiles,
+            trial_config,
+            safety_experts=safety_experts,
+            routing_config=artifact.routing,
+            benign_states=benign_states,
+            target_states=target_states,
         )
+    except Exception:
+        try:
+            engine.restore_baseline()
+        finally:
+            engine.config = previous_config
+        raise
 
-    _print_lm_eval_table(results_ab, results_base)
+    return trial_config
 
 
 def show_interactive_results(
@@ -395,6 +470,10 @@ def show_interactive_results(
     steering_vectors: Tensor,
     safety_experts,
     storage: JournalStorage,
+    *,
+    benign_states: Tensor | None = None,
+    target_states: Tensor | None = None,
+    steering_vector_variants: dict[str, Tensor] | None = None,
 ):
     """Post-optimisation interactive menu: trial selection, save, upload, chat."""
     while True:
@@ -500,17 +579,16 @@ def show_interactive_results(
             for name, value in format_trial_params(trial).items():
                 print(f"  * {name} = [bold]{value}[/]")
 
-            print("* Resetting model...")
-            engine.restore_baseline()
-            print("* Applying steering...")
-            apply_steering(
+            print("* Replaying saved steering recipe...")
+            trial_config = _restore_selected_trial(
+                trial,
+                config,
                 engine,
                 steering_vectors,
-                trial.user_attrs["vector_index"],
-                {
-                    k: SteeringProfile(**v)
-                    for k, v in trial.user_attrs["parameters"].items()
-                },
+                safety_experts,
+                benign_states=benign_states,
+                target_states=target_states,
+                steering_vector_variants=steering_vector_variants,
             )
 
             while True:
@@ -532,16 +610,31 @@ def show_interactive_results(
                 try:
                     match action:
                         case "Save the model to a local folder":
-                            _save_model_locally(config, engine)
+                            _save_model_locally(trial_config, engine)
 
                         case "Upload the model to Hugging Face":
-                            _upload_model(config, engine, scorer, trial)
+                            _upload_model(trial_config, engine, scorer, trial)
 
                         case "Chat with the model":
-                            _chat_with_model(config, engine)
+                            _chat_with_model(trial_config, engine)
 
                         case "Run standard benchmarks (lm-eval)":
-                            _run_benchmarks(config, engine, steering_vectors, trial)
+                            restored_config = _run_benchmarks(
+                                config,
+                                engine,
+                                steering_vectors,
+                                trial,
+                                safety_experts,
+                                benign_states=benign_states,
+                                target_states=target_states,
+                                steering_vector_variants=steering_vector_variants,
+                            )
+                            if restored_config is not None:
+                                trial_config = restored_config
 
                 except Exception as error:  # Catch-all for interactive menu actions
                     print(f"[red]Error: {error}[/]")
+
+            # The optimiser owns the original config object. Never let a
+            # selected trial's sampled recipe leak into additional trials.
+            engine.config = config

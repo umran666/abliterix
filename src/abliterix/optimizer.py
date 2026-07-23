@@ -23,7 +23,9 @@ from optuna.study import StudyDirection
 from optuna.trial import TrialState
 
 from .core.steering import apply_steering
+from .core.optimizer_support import vector_scope_choices
 from .data import format_trial_params
+from .scriptlib import build_trial_recipe
 from .settings import AbliterixConfig
 from .types import (
     DecayKernel,
@@ -95,6 +97,11 @@ def run_search(
             f"variants available: {list(_variants.keys())}[/]"
         )
 
+    _scope_choices = vector_scope_choices(
+        config,
+        _variants.values() if _variants is not None else [steering_vectors],
+    )
+
     _search_transform = (
         config.steering.search_direct_transform
         and config.steering.steering_mode == SteeringMode.DIRECT
@@ -120,7 +127,7 @@ def run_search(
 
         # --- Direct-mode transform choice (categorical) ---
         # Mutates config.steering.direct_transform for this trial only; the
-        # `finally` block at the end of apply+evaluate restores it.
+        # _objective_safe wrapper restores it after apply+evaluate.
         trial_direct_transform: DirectTransform | None = None
         if _search_transform:
             chosen = trial.suggest_categorical(
@@ -132,7 +139,7 @@ def run_search(
 
         # --- Decay-kernel choice (categorical) ---
         # Mutates config.steering.decay_kernel for this trial only; the
-        # `finally` block restores it. Lets TPE pick the layer-taper shape.
+        # _objective_safe wrapper restores it. Lets TPE pick the layer-taper shape.
         trial_decay_kernel: DecayKernel | None = None
         if config.steering.search_decay_kernel:
             chosen_kernel = trial.suggest_categorical(
@@ -143,21 +150,18 @@ def run_search(
             trial.set_user_attr("decay_kernel", chosen_kernel)
 
         # --- Steering-vector variant (single vs harmfulness pair) ---
+        trial_variant = "single"
         if _variants is not None:
             variant_keys = list(_variants.keys())
             chosen_variant = trial.suggest_categorical("steering_variant", variant_keys)
+            trial_variant = chosen_variant
             trial_vectors = _variants[chosen_variant]
             trial.set_user_attr("steering_variant", chosen_variant)
         else:
             trial_vectors = steering_vectors
 
         # --- Vector scope ---
-        scope_choices = (
-            [config.steering.fixed_vector_scope]
-            if config.steering.fixed_vector_scope
-            else ["global", "per layer"]
-        )
-        vector_scope = trial.suggest_categorical("vector_scope", scope_choices)
+        vector_scope = trial.suggest_categorical("vector_scope", _scope_choices)
 
         # Discrimination is strongest slightly past the midpoint.
         # Widen the search for shallow models (< 20 layers).
@@ -260,6 +264,17 @@ def run_search(
             "parameters",
             {k: asdict(v) for k, v in profiles.items()},
         )
+        trial.set_user_attr(
+            "steering_recipe",
+            build_trial_recipe(
+                config,
+                direct_transform=(
+                    trial_direct_transform or config.steering.direct_transform
+                ),
+                steering_variant=trial_variant,
+                vector_scope=vector_scope,
+            ),
+        )
 
         # --- Apply steering and evaluate ---
         print()
@@ -274,19 +289,10 @@ def run_search(
         proj_cache = getattr(engine, "_projection_cache", None)
         adapter_path = None
 
-        # Track whether we applied router suppression this trial so we can
-        # restore in the `finally` block regardless of TrialPruned / errors.
-        _moe_applied_this_trial = False
-        # Track whether the in-place editors mutated weights — needed for
-        # restore in the finally block.
-        _in_place_applied_this_trial = False
-
         # If the optimiser sampled a direct_transform this trial, swap it
-        # into the global config so apply_steering picks it up. Always
-        # restored in the `finally` block below.
-        _saved_direct_transform: DirectTransform | None = None
+        # into the global config so apply_steering picks it up. _objective_safe
+        # restores the original value for both apply and evaluation failures.
         if trial_direct_transform is not None:
-            _saved_direct_transform = config.steering.direct_transform
             config.steering.direct_transform = trial_direct_transform
             if trial_counter == 1:
                 print(
@@ -295,10 +301,8 @@ def run_search(
                 )
 
         # Swap the sampled decay kernel into the global config for this trial.
-        # Restored in the `finally` block below.
-        _saved_decay_kernel: DecayKernel | None = None
+        # _objective_safe restores the original value after evaluation.
         if trial_decay_kernel is not None:
-            _saved_decay_kernel = config.steering.decay_kernel
             config.steering.decay_kernel = trial_decay_kernel
             if trial_counter == 1:
                 print(f"* trial decay_kernel = [bold]{trial_decay_kernel.value}[/]")
@@ -338,6 +342,17 @@ def run_search(
             )
 
             print("* Applying steering (vLLM in-place)...")
+            # Arm editor-level restore guards before the first RPC.  Each
+            # editor normally flips `_applied` only after collective_rpc
+            # returns, which is too late if some workers mutate and another
+            # worker raises.  Their restore methods are safe no-ops when no
+            # backup/plan was written.
+            vllm_gen.attention_editor._applied = True
+            if _expert_editor is not None:
+                _expert_editor._applied = True
+            _moe_editor = getattr(vllm_gen, "moe_editor", None)
+            if _moe_editor is not None and safety_experts and routing is not None:
+                _moe_editor._applied = True
             _ip_result = apply_steering_vllm_inplace(
                 vllm_gen,
                 trial_vectors,
@@ -350,8 +365,6 @@ def run_search(
                 safety_experts=safety_experts,
                 routing_config=routing,
             )
-            _in_place_applied_this_trial = True
-            _moe_applied_this_trial = _ip_result.get("router_touched", 0) > 0
 
             if trial_counter == 1:
                 print(
@@ -398,13 +411,15 @@ def run_search(
                 routing is not None
                 and getattr(vllm_gen, "moe_editor", None) is not None
             ):
+                # As with attention/EGA editors, arm restore before RPC so a
+                # partial worker failure cannot leave a suppression plan live.
+                vllm_gen.moe_editor._applied = True
                 touched = vllm_gen.apply_router_suppression(
                     n_suppress=routing.n_suppress,
                     bias_value=routing.router_bias,
                 )
-                _moe_applied_this_trial = touched > 0
                 if trial_counter == 1:
-                    if _moe_applied_this_trial:
+                    if touched > 0:
                         scale = max(0.0, 1.0 + routing.router_bias / 10.0)
                         print(
                             f"  * Router suppression: n_suppress={routing.n_suppress}, "
@@ -435,42 +450,44 @@ def run_search(
                 target_states=target_states,
             )
 
-        try:
-            print("* Evaluating...")
-            kl, length_dev = scorer.measure_kl_and_coherence(engine)
+        print("* Evaluating...")
+        kl, length_dev = scorer.measure_kl_and_coherence(engine)
+        damage_metric = getattr(scorer, "last_damage_metric", None)
+        damage_metric_name = (
+            damage_metric.name if damage_metric is not None else "full_distribution_kl"
+        )
 
-            # Early pruning for excessively damaged models.
-            if config.kl.prune_threshold > 0 and kl > config.kl.prune_threshold:
-                print(
-                    f"  * [yellow]KL divergence {kl:.4f} exceeds prune threshold "
-                    f"{config.kl.prune_threshold}, skipping compliance check[/]"
-                )
-                raise TrialPruned()
+        # Early pruning for excessively damaged models.
+        if config.kl.prune_threshold > 0 and kl > config.kl.prune_threshold:
+            print(
+                f"  * [yellow]{damage_metric_name} {kl:.4f} exceeds prune threshold "
+                f"{config.kl.prune_threshold}, skipping compliance check[/]"
+            )
+            raise TrialPruned()
 
+        measure_compliance = getattr(
+            scorer,
+            "measure_compliance_objective",
+            None,
+        )
+        if callable(measure_compliance):
+            detected, compliance_objective = measure_compliance(engine)
+            objectives = scorer._compute_objectives(
+                kl,
+                detected,
+                length_dev,
+                compliance_objective_override=compliance_objective,
+            )
+        else:
+            # Compatibility with scorer-like integrations that predate the
+            # per-sample compliance contract.
             print("  * Counting model refusals...")
             detected = scorer.detector.evaluate_compliance(
                 engine,
                 scorer.target_msgs,
             )
             print(f"  * Refusals: [bold]{detected}[/]/{len(scorer.target_msgs)}")
-
             objectives = scorer._compute_objectives(kl, detected, length_dev)
-        finally:
-            # Always restore vLLM router edits so the next trial starts from
-            # the pristine base model.  No-op if nothing was applied.
-            if _moe_applied_this_trial and vllm_gen is not None:
-                vllm_gen.restore_router_suppression()
-            # Restore in-place edits (attention + EGA) so trial N+1 starts
-            # from pristine weights. Router already handled above.
-            if _in_place_applied_this_trial and vllm_gen is not None:
-                vllm_gen.restore_attention_weights()
-                vllm_gen.restore_expert_weights()
-            # Restore the global direct_transform if this trial sampled one.
-            if _saved_direct_transform is not None:
-                config.steering.direct_transform = _saved_direct_transform
-            # Restore the global decay_kernel if this trial sampled one.
-            if _saved_decay_kernel is not None:
-                config.steering.decay_kernel = _saved_decay_kernel
 
         # Timing / resource report
         elapsed = time.perf_counter() - start_time
@@ -485,6 +502,17 @@ def run_search(
             )
         report_memory()
 
+        if damage_metric is not None:
+            trial.set_user_attr(
+                "damage_metric",
+                {
+                    "name": damage_metric.name,
+                    "estimator": damage_metric.estimator,
+                    "units": damage_metric.units,
+                    "value": damage_metric.value,
+                },
+            )
+        # Kept for compatibility with existing studies and consumers.
         trial.set_user_attr("kl_divergence", kl)
         trial.set_user_attr("refusals", detected)
         trial.set_user_attr("length_deviation", length_dev)
@@ -495,11 +523,58 @@ def run_search(
         return objectives
 
     def _objective_safe(trial: Trial) -> tuple[float, float]:
+        # Establish cleanup intent before _objective can mutate either config
+        # or model state.  In particular, vLLM RPC editors may raise after a
+        # subset of workers has already applied its update.
+        vllm_gen = getattr(engine, "_vllm_gen", None)
+        proj_cache = getattr(engine, "_projection_cache", None)
+        original_direct_transform = config.steering.direct_transform
+        original_decay_kernel = config.steering.decay_kernel
+        in_place_cleanup_needed = bool(
+            vllm_gen is not None
+            and getattr(vllm_gen, "attention_editor", None) is not None
+        )
+        vllm_adapter_mode = bool(
+            vllm_gen is not None
+            and (proj_cache is not None or getattr(vllm_gen, "_lora_disabled", False))
+        )
+        hf_cleanup_needed = not in_place_cleanup_needed and not vllm_adapter_mode
+        router_cleanup_needed = bool(
+            vllm_gen is not None
+            and callable(getattr(vllm_gen, "restore_router_suppression", None))
+            and (
+                in_place_cleanup_needed
+                or getattr(vllm_gen, "moe_editor", None) is not None
+            )
+        )
+
         try:
-            return _objective(trial)
-        except KeyboardInterrupt:
-            trial.study.stop()
-            raise TrialPruned()
+            try:
+                return _objective(trial)
+            except KeyboardInterrupt:
+                trial.study.stop()
+                raise TrialPruned()
+        finally:
+            # Every cleanup decision above was made before the corresponding
+            # apply call.  Restore methods are intentionally safe no-ops when
+            # a backend failed before touching any weights.
+            try:
+                if router_cleanup_needed:
+                    vllm_gen.restore_router_suppression()
+            finally:
+                try:
+                    if in_place_cleanup_needed:
+                        try:
+                            vllm_gen.restore_attention_weights()
+                        finally:
+                            vllm_gen.restore_expert_weights()
+                    if hf_cleanup_needed:
+                        engine.restore_baseline()
+                finally:
+                    if vllm_gen is not None:
+                        engine._current_adapter_path = None
+                    config.steering.direct_transform = original_direct_transform
+                    config.steering.decay_kernel = original_decay_kernel
 
     # ----------------------------------------------------------------
     # Study creation / resumption

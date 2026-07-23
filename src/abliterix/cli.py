@@ -52,7 +52,7 @@ from .util import (
     slugify_model_name,
 )
 from .types import SteeringMode
-from .vectors import compute_steering_vectors
+from .vectors import compute_configured_steering_vectors
 
 
 # ---------------------------------------------------------------------------
@@ -824,29 +824,8 @@ def run():
                 target_states=target_states,
             )
         else:
-            vectors = compute_steering_vectors(
-                benign_states,
-                target_states,
-                config.steering.vector_method,
-                config.steering.orthogonal_projection,
-                winsorize=config.steering.winsorize_vectors,
-                winsorize_quantile=config.steering.winsorize_quantile,
-                projected_abliteration=config.steering.projected_abliteration,
-                ot_components=config.steering.ot_components,
-                n_directions=config.steering.n_directions,
-                sra_base_method=config.steering.sra_base_method,
-                sra_n_atoms=config.steering.sra_n_atoms,
-                sra_ridge_alpha=config.steering.sra_ridge_alpha,
-                ablate_harmfulness_direction=config.steering.ablate_harmfulness_direction,
-                harmfulness_layer_band=tuple(config.steering.harmfulness_layer_band),
-                som_grid_h=config.steering.som_grid_h,
-                som_grid_w=config.steering.som_grid_w,
-                som_n_iters=config.steering.som_n_iters,
-                som_initial_lr=config.steering.som_initial_lr,
-                som_seed=config.steering.som_seed,
-                sae_path=config.steering.sae_path,
-                sae_layer=config.steering.sae_layer,
-                sae_top_k=config.steering.sae_top_k,
+            vectors = compute_configured_steering_vectors(
+                benign_states, target_states, config
             )
 
         analyzer = ResidualAnalyzer(config, engine, benign_states, target_states)
@@ -1355,6 +1334,9 @@ def run():
             vectors,
             safety_experts,
             storage,
+            benign_states=benign_states,
+            target_states=target_states,
+            steering_vector_variants=_vector_variants,
         )
     finally:
         detector.close()

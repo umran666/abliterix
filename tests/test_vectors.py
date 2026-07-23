@@ -6,8 +6,12 @@ All tests use small synthetic tensors (no GPU, no model).
 import torch
 import torch.nn.functional as F
 
+from abliterix.settings import AbliterixConfig
 from abliterix.types import VectorMethod
-from abliterix.vectors import compute_steering_vectors
+from abliterix.vectors import (
+    compute_configured_steering_vectors,
+    compute_steering_vectors,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +39,149 @@ def test_mean_direction(synthetic_states):
     result = compute_steering_vectors(benign, target, VectorMethod.MEAN, False)
     expected = F.normalize(target.mean(dim=0) - benign.mean(dim=0), p=2, dim=1)
     assert torch.allclose(result, expected, atol=1e-5)
+
+
+def test_multi_direction_keeps_mean_difference_as_primary_direction():
+    """Rank-k extraction must retain the refusal mean shift as direction 0."""
+    # Each layer has a constant mean shift plus stronger, zero-mean variation
+    # along axes orthogonal to that shift.  Centring before SVD therefore
+    # makes the old implementation select residual noise as direction 0.
+    benign = torch.zeros(6, 2, 4)
+    target = benign.clone()
+    target[:, 0, 0] = 2.0
+    target[:, 1, 1] = -3.0
+
+    coefficients = torch.tensor([-5.0, -3.0, -1.0, 1.0, 3.0, 5.0])
+    target[:, 0, 1] += coefficients
+    target[:, 1, 2] += coefficients * 2.0
+
+    actual = compute_steering_vectors(
+        benign,
+        target,
+        VectorMethod.MEAN,
+        False,
+        n_directions=3,
+    )
+    expected_primary = F.normalize(
+        target.mean(dim=0) - benign.mean(dim=0),
+        p=2,
+        dim=1,
+    )
+
+    torch.testing.assert_close(actual[0], expected_primary)
+
+
+def test_multi_direction_residuals_are_unit_and_mutually_orthogonal():
+    benign = torch.zeros(8, 1, 5)
+    target = benign.clone()
+    target[:, 0, 0] = 2.0
+    target[:, 0, 1] += 4.0 * torch.tensor([1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0])
+    target[:, 0, 2] += 2.0 * torch.tensor([1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0])
+
+    actual = compute_steering_vectors(
+        benign,
+        target,
+        VectorMethod.MEAN,
+        False,
+        n_directions=3,
+    )
+    gram = actual[:, 0, :] @ actual[:, 0, :].T
+
+    torch.testing.assert_close(gram, torch.eye(3), atol=1e-6, rtol=1e-6)
+
+
+def test_multi_direction_does_not_spend_residual_rank_on_mean_axis():
+    """Mean-axis residual variance must not hide a smaller independent axis."""
+    benign = torch.zeros(4, 1, 4)
+    target = benign.clone()
+    mean_axis_coefficients = torch.tensor([1.0, -1.0, 0.0, 0.0])
+    orthogonal_coefficients = torch.tensor([0.0, 0.0, 1.0, -1.0])
+    target[:, 0, 0] = 10.0 + 8.0 * mean_axis_coefficients
+    target[:, 0, 1] = orthogonal_coefficients
+
+    actual = compute_steering_vectors(
+        benign,
+        target,
+        VectorMethod.MEAN,
+        False,
+        n_directions=2,
+    )
+
+    assert torch.linalg.vector_norm(actual[1, 0]).item() == 1.0
+    assert abs(actual[1, 0, 1].item()) == 1.0
+
+
+def test_multi_direction_applies_winsorization_and_preserves_zero_directions():
+    benign = torch.zeros(4, 1, 4)
+    target = torch.tensor([100.0, 1.0, 1.0, 1.0]).repeat(4, 1, 1)
+
+    actual = compute_steering_vectors(
+        benign,
+        target,
+        VectorMethod.MEAN,
+        False,
+        n_directions=2,
+        winsorize=True,
+        winsorize_quantile=0.5,
+    )
+
+    torch.testing.assert_close(actual[0, 0], torch.full((4,), 0.5))
+    torch.testing.assert_close(actual[1, 0], torch.zeros(4))
+
+
+def test_multi_direction_reorthogonalizes_after_winsorization_and_projection():
+    benign_mean = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0])
+    benign = benign_mean.repeat(8, 1, 1)
+    target = benign.clone()
+    target[:, 0, 0] += 2.0
+    target[:, 0, 1] += 4.0 * torch.tensor([1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0])
+    target[:, 0, 2] += 2.0 * torch.tensor([1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0])
+
+    actual = compute_steering_vectors(
+        benign,
+        target,
+        VectorMethod.MEAN,
+        False,
+        n_directions=3,
+        winsorize=True,
+        winsorize_quantile=0.9,
+        projected_abliteration=True,
+    )
+    nonzero = torch.linalg.vector_norm(actual[:, 0, :], dim=1) > 1e-6
+    basis = actual[nonzero, 0, :]
+
+    assert basis.shape[0] == 3
+    torch.testing.assert_close(
+        basis @ basis.T,
+        torch.eye(3),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_configured_vector_helper_uses_complete_recipe(synthetic_states):
+    benign, target = synthetic_states
+    config = AbliterixConfig(
+        model={"model_id": "dummy/model"},
+        steering={
+            "vector_method": "mean",
+            "orthogonal_projection": False,
+            "winsorize_vectors": True,
+            "winsorize_quantile": 0.9,
+        },
+    )
+
+    actual = compute_configured_steering_vectors(benign, target, config)
+    expected = compute_steering_vectors(
+        benign,
+        target,
+        VectorMethod.MEAN,
+        False,
+        winsorize=True,
+        winsorize_quantile=0.9,
+    )
+
+    torch.testing.assert_close(actual, expected)
 
 
 # ---------------------------------------------------------------------------

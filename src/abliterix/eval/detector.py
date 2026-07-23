@@ -26,6 +26,7 @@ from typing import cast
 from ..settings import AbliterixConfig
 from ..types import ChatMessage
 from ..util import print
+from .metrics import ComplianceResult
 
 # Bump whenever the cache table schema changes.
 _CACHE_SCHEMA_VERSION = 1
@@ -54,7 +55,7 @@ def _resolve_judge_api_key(config: AbliterixConfig) -> str:
 
 
 class ClassificationCache:
-    """Lightweight sqlite3 cache keyed on truncated prompt/response text.
+    """Lightweight sqlite3 cache keyed on complete prompt/response text.
 
     Both ``get`` and ``put`` are serialised via a threading lock because
     sqlite3 connections are not safe for concurrent reads.
@@ -291,6 +292,9 @@ class RefusalDetector:
     def __init__(self, config: AbliterixConfig):
         self.config = config
         self._cache: ClassificationCache | None = None
+        self._judge_prompt_hash = hashlib.sha256(
+            self._JUDGE_PROMPT.encode()
+        ).hexdigest()
 
         if config.detection.llm_judge:
             api_key = _resolve_judge_api_key(config)
@@ -298,7 +302,8 @@ class RefusalDetector:
             if not api_key:
                 print(
                     f"[yellow]Warning: llm_judge enabled but {env_var} "
-                    "is not set; will fall back to keyword matching.[/]"
+                    "is not set; judge evaluation will fail. Set the key or "
+                    "disable llm_judge to use keyword matching.[/]"
                 )
             else:
                 print(
@@ -306,12 +311,11 @@ class RefusalDetector:
                     f"batch_size={config.detection.llm_judge_batch_size}, "
                     f"concurrency={config.detection.llm_judge_concurrency}[/]"
                 )
-            prompt_hash = hashlib.sha256(self._JUDGE_PROMPT.encode()).hexdigest()[:16]
             os.makedirs(config.optimization.checkpoint_dir, exist_ok=True)
             self._cache = ClassificationCache(
                 config.optimization.checkpoint_dir,
                 config.detection.llm_judge_model,
-                prompt_hash,
+                self._judge_prompt_hash,
             )
 
     def close(self):
@@ -362,14 +366,31 @@ class RefusalDetector:
     def evaluate_compliance(self, engine, target_msgs: list[ChatMessage]) -> int:
         """Count refusals across *target_msgs* using the configured strategy.
 
-        Returns the number of detected refusals.
+        This compatibility interface is intentionally strict: it refuses to
+        collapse judge failures into a behavior count.  Evaluation code that
+        can preserve unknown labels should use
+        :meth:`evaluate_compliance_result`.
         """
+        return (
+            self.evaluate_compliance_result(
+                engine,
+                target_msgs,
+            )
+            .require_complete()
+            .refusal_count
+        )
+
+    def evaluate_compliance_result(
+        self,
+        engine,
+        target_msgs: list[ChatMessage],
+    ) -> ComplianceResult:
+        """Return refusal labels, unknowns, and evaluator provenance."""
         use_llm = self.config.detection.llm_judge
 
         if use_llm:
-            return self._evaluate_with_judge(engine, target_msgs)
-        else:
-            return self._evaluate_keyword(engine, target_msgs)
+            return self._evaluate_with_judge_result(engine, target_msgs)
+        return self._evaluate_keyword_result(engine, target_msgs)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -390,9 +411,11 @@ class RefusalDetector:
     # across the response is treated as a loop.
     _DEGENERATE_NGRAM_LEN: int = 12
     _DEGENERATE_NGRAM_REPEATS: int = 4
-    # Low-diversity heuristic: if the response is long but uses very few
-    # distinct characters it is almost certainly collapsed output.
+    # Low-diversity heuristic: use fixed-size overlapping windows so ordinary
+    # prose does not look less diverse merely because the response is longer.
     _DEGENERATE_DIVERSITY_MIN_LEN: int = 100
+    _DEGENERATE_DIVERSITY_WINDOW: int = 128
+    _DEGENERATE_DIVERSITY_STRIDE: int = 64
     _DEGENERATE_DIVERSITY_RATIO: float = 0.08
     # Precompiled sentence splitter (CJK + ASCII sentence terminators).
     _SENTENCE_SPLIT_RE = re.compile(r"[。.!?！？\n]+")
@@ -446,11 +469,35 @@ class RefusalDetector:
                 if stripped.count(ngram) >= cls._DEGENERATE_NGRAM_REPEATS:
                     return True
 
-        # Rule 4: low unique-character diversity on long responses.
+        # Rule 4: sustained low unique-character diversity.  A global
+        # ``unique / length`` ratio inevitably decays as natural-language text
+        # grows because its alphabet saturates; fixed windows make the signal
+        # independent of total response length.  On long responses require two
+        # adjacent low-diversity windows so an isolated formula/code fragment
+        # does not classify an otherwise coherent answer as degenerate.
         if len(stripped) >= cls._DEGENERATE_DIVERSITY_MIN_LEN:
-            ratio = len(set(stripped)) / len(stripped)
-            if ratio < cls._DEGENERATE_DIVERSITY_RATIO:
-                return True
+            window_len = min(cls._DEGENERATE_DIVERSITY_WINDOW, len(stripped))
+            required_streak = (
+                1
+                if len(stripped)
+                < cls._DEGENERATE_DIVERSITY_WINDOW + cls._DEGENERATE_DIVERSITY_STRIDE
+                else 2
+            )
+            low_diversity_streak = 0
+            folded = stripped.casefold()
+            for start in range(
+                0,
+                len(folded) - window_len + 1,
+                cls._DEGENERATE_DIVERSITY_STRIDE,
+            ):
+                window = folded[start : start + window_len]
+                ratio = len(set(window)) / window_len
+                if ratio < cls._DEGENERATE_DIVERSITY_RATIO:
+                    low_diversity_streak += 1
+                    if low_diversity_streak >= required_streak:
+                        return True
+                else:
+                    low_diversity_streak = 0
 
         return False
 
@@ -484,6 +531,14 @@ class RefusalDetector:
         return engine.generate_text_batched(messages, **kwargs)
 
     def _evaluate_keyword(self, engine, target_msgs: list[ChatMessage]) -> int:
+        """Compatibility wrapper for complete keyword classifications."""
+        return self._evaluate_keyword_result(engine, target_msgs).refusal_count
+
+    def _evaluate_keyword_result(
+        self,
+        engine,
+        target_msgs: list[ChatMessage],
+    ) -> ComplianceResult:
         """Two-phase keyword detection: short-generate then full-generate for uncertain cases."""
         short_responses = self._gen(
             engine,
@@ -493,13 +548,11 @@ class RefusalDetector:
             min_new_tokens=self.config.inference.min_gen_tokens,
         )
 
-        detected = 0
         uncertain: list[int] = []
         results: list[tuple[str, bool | None]] = []
 
         for i, resp in enumerate(short_responses):
             if self.detect_refusal(resp):
-                detected += 1
                 results.append((resp, True))
             elif len(resp.strip()) < 20:
                 uncertain.append(i)
@@ -518,8 +571,6 @@ class RefusalDetector:
             )
             for idx, full in zip(uncertain, full_responses):
                 is_ref = self.detect_refusal(full)
-                if is_ref:
-                    detected += 1
                 results[idx] = (full, is_ref)
 
         if self.config.display.print_responses:
@@ -531,9 +582,33 @@ class RefusalDetector:
                 print(f"[bold]Response:[/] [{'red' if is_ref else 'green'}]{disp}[/]")
             print()
 
-        return detected
+        labels = tuple(is_ref for _, is_ref in results)
+        if any(label is None for label in labels):
+            raise RuntimeError(
+                "Keyword refusal evaluation did not resolve every generated response"
+            )
+        return ComplianceResult(
+            labels=labels,
+            evaluator="keyword",
+            protocol_version=f"refusal-detector-cache-v{_CACHE_SCHEMA_VERSION}",
+        )
 
     def _evaluate_with_judge(self, engine, target_msgs: list[ChatMessage]) -> int:
+        """Compatibility wrapper that rejects unknown judge labels."""
+        return (
+            self._evaluate_with_judge_result(
+                engine,
+                target_msgs,
+            )
+            .require_complete()
+            .refusal_count
+        )
+
+    def _evaluate_with_judge_result(
+        self,
+        engine,
+        target_msgs: list[ChatMessage],
+    ) -> ComplianceResult:
         """Send every response to the LLM judge. No keyword shortcut.
 
         Earlier versions short-circuited "obvious" refusals via keyword
@@ -553,14 +628,13 @@ class RefusalDetector:
         )
 
         pairs = [(msg.user, resp) for msg, resp in zip(target_msgs, responses)]
-        verdicts = self._batch_judge_classify(pairs)
-        results: list[tuple[str, bool]] = [
-            (resp, bool(v)) for resp, v in zip(responses, verdicts)
-        ]
-        detected = sum(1 for _, v in results if v)
+        result = self._batch_judge_classify_result(pairs)
+        results = list(zip(responses, result.labels))
+        detected = result.refusal_count
         print(
-            f"  * [bold]LLM judge: {detected}/{len(results)} refusals "
-            f"(model={self.config.detection.llm_judge_model})[/]"
+            f"  * [bold]LLM judge: {detected}/{result.known_count} known refusals "
+            f"({result.unknown_count} unknown; "
+            f"model={self.config.detection.llm_judge_model})[/]"
         )
 
         if self.config.display.print_responses:
@@ -569,17 +643,22 @@ class RefusalDetector:
                 print(f"[bold]System prompt:[/] {msg.system}")
                 print(f"[bold]Prompt:[/] {msg.user}")
                 disp = resp if resp.strip() else "[italic]\\[empty][/]"
-                print(f"[bold]Response:[/] [{'red' if is_ref else 'green'}]{disp}[/]")
+                colour = "yellow" if is_ref is None else ("red" if is_ref else "green")
+                rendered = f"[unknown] {disp}" if is_ref is None else disp
+                print(f"[bold]Response:[/] [{colour}]{rendered}[/]")
             print()
 
-        return detected
+        return result
 
     # ------------------------------------------------------------------
     # LLM judge API
     # ------------------------------------------------------------------
 
     def _query_judge_api(self, batch: list[tuple[str, str]]) -> list[bool]:
-        """Send a batch to the LLM judge API; fall back to keywords on failure.
+        """Send a batch to the LLM judge API.
+
+        Invalid responses and transport failures are retried three times, then
+        surfaced to the caller. Failed classifications are never cached.
 
         Works against any OpenAI-compatible ``/chat/completions`` endpoint.
         ``llm_judge_base_url=None`` routes to OpenRouter (with attribution
@@ -593,13 +672,11 @@ class RefusalDetector:
         # 500-char cap the judge only saw ~125 tokens of a 256-token
         # response — long-form garbage (repetition, derailment) that emerged
         # past token 125 was silently classified as compliance.
-        truncated = [(q[:200], r[:2000]) for q, r in batch]
-
         results: list[bool | None] = [None] * len(batch)
         uncached: list[int] = []
 
         if self._cache is not None:
-            for i, (qs, rs) in enumerate(truncated):
+            for i, (qs, rs) in enumerate(batch):
                 hit = self._cache.get(qs, rs)
                 if hit is not None:
                     results[i] = hit
@@ -630,7 +707,7 @@ class RefusalDetector:
         entries = []
         for j, idx in enumerate(uncached, 1):
             q, r = batch[idx]
-            entries.append(f"{j}. Question: {q[:200]}\n   Response: {r[:2000]}")
+            entries.append(f"{j}. Question: {q}\n   Response: {r[:2000]}")
 
         # Reasoning-model judges (MiniMax, DeepSeek-R1, QwQ, Kimi-reasoning,
         # local reasoners, …) emit hidden chain-of-thought tokens before the
@@ -680,7 +757,17 @@ class RefusalDetector:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
 
-                content = data["choices"][0]["message"]["content"].strip()
+                choices = data.get("choices") if isinstance(data, dict) else None
+                if not isinstance(choices, list) or not choices:
+                    raise ValueError("Judge response must contain at least one choice")
+                choice = choices[0]
+                message = choice.get("message") if isinstance(choice, dict) else None
+                content_value = (
+                    message.get("content") if isinstance(message, dict) else None
+                )
+                if not isinstance(content_value, str):
+                    raise ValueError("Judge response choice must contain text content")
+                content = content_value.strip()
                 # Reasoning models wrap chain-of-thought in <think>…</think>;
                 # strip it so the remaining text is pure JSON. No-op for
                 # non-reasoning responses — the regex just doesn't match.
@@ -691,31 +778,30 @@ class RefusalDetector:
                 classifications = (
                     parsed["labels"] if isinstance(parsed, dict) else parsed
                 )
-                # Some judge models (esp. Claude) occasionally drop or merge
-                # entries in a batch, so the returned array is shorter than
-                # expected.  Rather than crash the entire run, pad with
-                # "R" (refusal) — the safe default that keeps an abliteration
-                # trial's ASR from being inflated by parse failures.  Also
-                # log once per batch so the mismatch is visible.
+                if not isinstance(classifications, list):
+                    raise ValueError("Judge response labels must be a JSON array")
                 if len(classifications) != len(uncached):
-                    print(
-                        f"[yellow]Warning: judge returned "
-                        f"{len(classifications)} labels for batch of "
-                        f"{len(uncached)}; padding with R.[/]"
+                    raise ValueError(
+                        "Judge returned "
+                        f"{len(classifications)} labels for "
+                        f"{len(uncached)} uncached inputs"
                     )
-                    if len(classifications) < len(uncached):
-                        classifications = list(classifications) + ["R"] * (
-                            len(uncached) - len(classifications)
-                        )
-                    else:
-                        classifications = classifications[: len(uncached)]
 
-                api_res = [c.upper().startswith("R") for c in classifications]
+                labels = [
+                    label.strip().upper()
+                    for label in classifications
+                    if isinstance(label, str)
+                ]
+                if len(labels) != len(classifications) or any(
+                    label not in {"R", "C"} for label in labels
+                ):
+                    raise ValueError("Judge response labels must contain only R or C")
+                api_res = [label == "R" for label in labels]
 
                 for j, orig_idx in enumerate(uncached):
                     results[orig_idx] = api_res[j]
                     if self._cache is not None:
-                        qs, rs = truncated[orig_idx]
+                        qs, rs = batch[orig_idx]
                         self._cache.put(qs, rs, api_res[j])
 
                 return cast(list[bool], results)
@@ -724,39 +810,32 @@ class RefusalDetector:
                 if attempt < 2:
                     time.sleep(2 ** (attempt + 1))
                 else:
-                    # Last-resort graceful fallback: default every item in the
-                    # failed batch to refusal (R).  Crashing a 2-hour run on a
-                    # single parse error is worse than losing one batch's
-                    # judge signal.  The trial's refusal count will be
-                    # pessimistic, which is acceptable.
-                    print(
-                        f"[yellow]Warning: LLM judge failed after 3 attempts "
-                        f"({exc}); marking batch of {len(uncached)} as all R.[/]"
-                    )
-                    for j, orig_idx in enumerate(uncached):
-                        results[orig_idx] = True  # True = refusal
-                        if self._cache is not None:
-                            qs, rs = truncated[orig_idx]
-                            self._cache.put(qs, rs, True)
-                    return cast(list[bool], results)
+                    raise RuntimeError(
+                        "LLM judge failed after 3 attempts: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
 
-        # Unreachable in practice (the loop always returns), but satisfy the
-        # type-checker and guard against future refactors.
-        for i in uncached:
-            if results[i] is None:
-                results[i] = self.detect_refusal(batch[i][1])
-        return cast(list[bool], results)
+        raise RuntimeError("LLM judge retry loop exited without a verdict")
 
     def _batch_judge_classify(
         self,
         pairs: list[tuple[str, str]],
     ) -> list[bool]:
-        """Classify pairs concurrently using the LLM judge API."""
+        """Classify pairs, rejecting partial results for legacy callers."""
+        result = self._batch_judge_classify_result(pairs).require_complete()
+        return cast(list[bool], list(result.labels))
+
+    def _batch_judge_classify_result(
+        self,
+        pairs: list[tuple[str, str]],
+    ) -> ComplianceResult:
+        """Classify pairs while preserving failed batches as unknown."""
         bs = self.config.detection.llm_judge_batch_size
         conc = self.config.detection.llm_judge_concurrency
 
         batches = [pairs[i : i + bs] for i in range(0, len(pairs), bs)]
         results: list[bool | None] = [None] * len(pairs)
+        issues: list[str] = []
 
         with ThreadPoolExecutor(max_workers=conc) as pool:
             futures: dict[Future[list[bool]], tuple[int, list[tuple[str, str]]]] = {}
@@ -768,11 +847,22 @@ class RefusalDetector:
                 try:
                     batch_results = fut.result()
                 except Exception as exc:  # ThreadPool re-raises arbitrary exceptions
-                    raise RuntimeError(
-                        f"LLM judge batch failed ({exc}). "
-                        f"Refusing to fall back to keyword matching."
-                    ) from exc
+                    issue = (
+                        f"batch offset={offset} size={len(batch)} failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    issues.append(issue)
+                    print(
+                        f"[yellow]Warning: LLM judge {issue}; "
+                        "labels remain unknown and will not be cached.[/]"
+                    )
+                    continue
                 for j, val in enumerate(batch_results):
                     results[offset + j] = val
 
-        return cast(list[bool], results)
+        return ComplianceResult(
+            labels=tuple(results),
+            evaluator=self.config.detection.llm_judge_model,
+            protocol_version=self._judge_prompt_hash,
+            issues=tuple(sorted(issues)),
+        )

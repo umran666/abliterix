@@ -351,8 +351,8 @@ def profile_safety_experts_vllm(
 
     Requires the LLM to have been constructed with
     ``enable_return_routed_experts=True`` (abliterix's
-    ``[model].vllm_return_routed_experts`` defaults to True; flip it off
-    to skip this path). The function runs ``llm.generate`` once over the
+    ``[model].vllm_return_routed_experts`` auto-enables this for MoE; set it
+    to False to skip this path). The function runs ``llm.generate`` once over the
     benign prompt set and once over the target prompt set with
     ``max_tokens=1`` (prefill-only, gives full prompt-token routing),
     aggregates per-(layer, expert) counts driver-side, and computes risk

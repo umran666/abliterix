@@ -34,6 +34,15 @@ def main():
     parser.add_argument(
         "--save-local", default=None, help="Also save locally to this path"
     )
+    parser.add_argument(
+        "--format",
+        choices=("merged", "adapter"),
+        default="merged",
+        help=(
+            "Export a standalone merged checkpoint or the exact dynamic LoRA "
+            "adapter (avoids BF16 merge-rounding drift)."
+        ),
+    )
     args = parser.parse_args()
 
     os.environ["AX_CONFIG"] = args.config
@@ -49,25 +58,34 @@ def main():
 
     torch.set_grad_enabled(False)
 
-    from abliterix.scriptlib import load_trial, extract_trial_params, setup_io
+    from abliterix.scriptlib import (
+        apply_trial_artifact,
+        compute_trial_vectors,
+        extract_trial_artifact,
+        load_trial,
+        setup_io,
+    )
     from abliterix.core.engine import SteeringEngine
     from abliterix.core.steering import apply_steering
     from abliterix.data import load_prompt_dataset
     from abliterix.settings import AbliterixConfig
-    from abliterix.vectors import compute_steering_vectors
     from abliterix.util import flush_memory
 
     setup_io()
 
     # Load trial
     trial = load_trial(args.checkpoint, args.model, args.trial)
-    direction_index, parameters, routing = extract_trial_params(trial)
+    artifact = extract_trial_artifact(trial)
+    direction_index = artifact.vector_index
+    parameters = artifact.profiles
+    routing = artifact.routing
     refusals = trial.user_attrs.get("refusals")
     kl = trial.user_attrs.get("kl_divergence")
     print(f"Trial #{args.trial}: refusals={refusals}, KL={kl}")
 
     # Load model
     config = AbliterixConfig()
+    apply_trial_artifact(config, artifact)
     engine = SteeringEngine(config)
 
     # Compute steering vectors
@@ -76,16 +94,7 @@ def main():
     target = load_prompt_dataset(config, config.target_prompts)
     benign_states = engine.extract_hidden_states_batched(benign)
     target_states = engine.extract_hidden_states_batched(target)
-    vectors = compute_steering_vectors(
-        benign_states,
-        target_states,
-        config.steering.vector_method,
-        config.steering.orthogonal_projection,
-        winsorize=config.steering.winsorize_vectors,
-        winsorize_quantile=config.steering.winsorize_quantile,
-    )
-    del benign_states, target_states
-    flush_memory()
+    vectors = compute_trial_vectors(artifact, benign_states, target_states, config)
 
     # Profile MoE experts if applicable
     safety_experts = None
@@ -106,23 +115,25 @@ def main():
         config,
         safety_experts=safety_experts,
         routing_config=routing,
+        benign_states=benign_states,
+        target_states=target_states,
     )
     print("Steering applied.")
-
-    # Get the base model — merge LoRA adapters and fully unwrap PEFT.
-    # Direct steering modifies base weights in-place, but PEFT wrapper
-    # still wraps them. merge_and_unload() returns the clean base model.
-    from peft import PeftModel
-
-    model = engine.model
-    if isinstance(model, PeftModel):
-        print("Merging LoRA adapters and unwrapping PEFT...")
-        model = model.merge_and_unload()
+    del benign_states, target_states
+    flush_memory()
 
     # Save locally first (root filesystem is tiny, use /workspace)
     save_dir = args.save_local or "/workspace/export_model"
-    print(f"\nSaving model to {save_dir}...")
-    model.save_pretrained(save_dir)
+    print(f"\nSaving {args.format} export to {save_dir}...")
+    if args.format == "adapter":
+        # Adapter export preserves the live LoRA computation. A BF16 merge can
+        # introduce small rounding drift even though top-1 output is stable.
+        engine.export_adapter(save_dir)
+    else:
+        # Use the engine's export contract so runtime-only and unfaithful
+        # quantized exports fail loudly instead of silently losing steering.
+        model = engine.export_merged()
+        model.save_pretrained(save_dir)
     engine.tokenizer.save_pretrained(save_dir)
     print("Local save complete.")
 

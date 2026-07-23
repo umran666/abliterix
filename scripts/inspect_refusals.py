@@ -12,7 +12,13 @@ skips TrialScorer baseline (logprobs/responses), only generates final responses.
 
 import sys
 
-from abliterix.scriptlib import extract_trial_params, load_trial, setup_io
+from abliterix.scriptlib import (
+    apply_trial_artifact,
+    compute_trial_vectors,
+    extract_trial_artifact,
+    load_trial,
+    setup_io,
+)
 
 setup_io()
 
@@ -24,7 +30,6 @@ sys.argv = ["inspect", "--model.model-id", MODEL, "--inference.batch-size", "2"]
 
 import gc  # noqa: E402
 import torch  # noqa: E402
-import torch.nn.functional as F  # noqa: E402
 
 from abliterix.settings import AbliterixConfig  # noqa: E402
 from abliterix.core.steering import apply_steering  # noqa: E402
@@ -34,9 +39,10 @@ from abliterix.data import load_prompt_dataset  # noqa: E402
 
 # Load trial from checkpoint
 trial = load_trial("checkpoints_test", MODEL, TRIAL_NUMBER)
-direction_index, parameters, _ = extract_trial_params(trial)
+artifact = extract_trial_artifact(trial)
 
 config = AbliterixConfig()
+apply_trial_artifact(config, artifact)
 
 print(f"Loading {MODEL}...")
 engine = SteeringEngine(config)
@@ -53,15 +59,11 @@ print("Computing refusal directions...")
 with torch.no_grad():
     benign_residuals = engine.extract_hidden_states_batched(benign_prompts)
     target_residuals = engine.extract_hidden_states_batched(target_prompts)
-    benign_means = benign_residuals.mean(dim=0)
-    target_means = target_residuals.mean(dim=0)
-    refusal_directions = F.normalize(target_means - benign_means, p=2, dim=1)
+    refusal_directions = compute_trial_vectors(
+        artifact, benign_residuals, target_residuals, config
+    )
 
 del (
-    benign_residuals,
-    target_residuals,
-    benign_means,
-    target_means,
     benign_prompts,
     target_prompts,
 )
@@ -77,7 +79,19 @@ print(f"  {len(eval_target_prompts)} prompts loaded")
 # Apply abliteration
 print(f"\nApplying Trial #{TRIAL_NUMBER} abliteration...")
 engine.restore_baseline()
-apply_steering(engine, refusal_directions, direction_index, parameters)
+apply_steering(
+    engine,
+    refusal_directions,
+    artifact.vector_index,
+    artifact.profiles,
+    config,
+    routing_config=artifact.routing,
+    benign_states=benign_residuals,
+    target_states=target_residuals,
+)
+del benign_residuals, target_residuals
+gc.collect()
+torch.cuda.empty_cache()
 
 # Increase batch size for generation (less memory than residuals)
 config.inference.batch_size = 8

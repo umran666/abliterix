@@ -156,13 +156,16 @@ The deep details live in `docs/` and `benchmarks/`:
 
 - **[docs/architecture.md](docs/architecture.md)** — the 9 papers Abliterix integrates and the 5-step pipeline.
 - **[docs/methods.md](docs/methods.md)** — every steering method (SRA, Spherical, SVF, Projected, Discriminative, COSMIC, Angular, OT, Multi-direction) with the TOML knobs that control it.
+- **[docs/method_maturity.md](docs/method_maturity.md)** — evidence levels for every method, from implementation to leading claims.
 - **[docs/evaluation.md](docs/evaluation.md)** — why most abliteration benchmarks lie, our standards, and the architecture A/B test.
+- **[docs/evidence_resources.md](docs/evidence_resources.md)** — GPU/API/storage resources needed to turn method claims into reproducible evidence.
 - **[docs/moe.md](docs/moe.md)** — the four independent MoE steering mechanisms and supported MoE models.
 - **[docs/configuration.md](docs/configuration.md)** — config loading order, the 150+ shipped configs, the Web UI, and research-mode visualization.
 - **[docs/datasets.md](docs/datasets.md)** — bilingual dataset design rationale and metadata schema.
 - **[docs/references.md](docs/references.md)** — paper references and BibTeX.
 - **[docs/benchmarks/2026-05-pod-validation.md](docs/benchmarks/2026-05-pod-validation.md)** — measured 10-feature sweep on Qwen2.5-7B-Instruct with LLM judge (Blackwell GPU).
-- **[benchmarks/SPEC.md](benchmarks/SPEC.md)** — the frozen HonestAbliterationBench contract (`spec_version 1.0`).
+- **[benchmarks/METHOD_MATRIX.md](benchmarks/METHOD_MATRIX.md)** — cross-model method matrix for promoting methods through the maturity ladder.
+- **[benchmarks/SPEC.md](benchmarks/SPEC.md)** — the frozen HonestAbliterationBench contract (`spec_version 1.1`).
 - **[benchmarks/CONTRIBUTING.md](benchmarks/CONTRIBUTING.md)** — how to submit a leaderboard row (self-reported / verified tiers).
 
 

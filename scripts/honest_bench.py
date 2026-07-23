@@ -3,7 +3,7 @@
 """HonestAbliterationBench runner.
 
 Reproducible benchmark for abliterated language models. Implements the
-contract defined in benchmarks/SPEC.md (spec_version 1.0).
+contract defined in benchmarks/SPEC.md (spec_version 1.1).
 
 Usage:
     python scripts/honest_bench.py \
@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Spec constants — DO NOT change without bumping benchmarks/SPEC.md.
 # ---------------------------------------------------------------------------
 
-SPEC_VERSION = "1.0"
+SPEC_VERSION = "1.1"
 SPEC_MIN_NEW_TOKENS = 100
 SPEC_MAX_NEW_TOKENS = 150
 SPEC_JUDGE_MODEL = "google/gemini-3-flash-preview"
@@ -474,14 +474,23 @@ def main() -> int:  # noqa: PLR0915 — top-level orchestration is intentionally
         "over_refusal_rate_by_category": _bucket_rates(
             benign_entries, over_refusal_labels, "category"
         ),
-        "kl_vs_base": round(kl_vs_base, 6),
+        "damage_metric": {
+            "name": "full_distribution_kl",
+            "estimator": "mean_per_token_kl",
+            "units": "nats/token",
+            "value": round(kl_vs_base, 6),
+        },
         "degenerate_rate": round(degenerate_rate, 6),
         "mean_response_length": round(mean_len, 3),
         "length_z_score": round(length_z, 3),
         "n_harmful": len(harmful_entries),
         "n_benign": len(benign_entries),
         "judge_model": SPEC_JUDGE_MODEL,
+        "judge_prompt_sha256": detector._judge_prompt_hash,  # noqa: SLF001
         "judge_cache_sha256": judge_cache_sha,
+        "judge_max_attempts": 3,
+        "judge_unknown_harmful": 0,
+        "judge_unknown_benign": 0,
         "dataset_sha256_harmful": harmful_sha,
         "dataset_sha256_benign": benign_sha,
         "commit": _git_commit(),

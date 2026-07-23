@@ -47,13 +47,26 @@ from ..types import ChatMessage
 from ..util import print
 
 
-# Default LoRA rank to declare to vLLM when the user has not pinned
-# ``vllm_max_lora_rank`` in their recipe. vLLM 0.20.x's own default for
-# ``LoRAConfig.max_lora_rank`` is 16, so we mirror it here. Adapters with
-# rank < this value are zero-padded by ``_serialize_adapter`` so vLLM
-# accepts them; adapters with rank > this value would require the user to
-# bump ``vllm_max_lora_rank``.
-_DEFAULT_VLLM_MAX_LORA_RANK = 16
+# Abliterix's ProjectionCache emits rank-1 adapters. Declaring vLLM rank 1
+# avoids padding every tensor and kernel invocation to vLLM's generic rank-16
+# default. External or future rank-k adapters must set ``vllm_max_lora_rank``
+# explicitly.
+_DEFAULT_VLLM_MAX_LORA_RANK = 1
+
+
+def _require_single_direction_vectors(
+    steering_vectors: Tensor, *, operation: str
+) -> None:
+    """Reject stacked rank-k vectors before ProjectionCache can mis-index them."""
+    if steering_vectors.ndim != 2:
+        raise ValueError(
+            f"{operation} requires a 2-D single-direction steering tensor "
+            f"with shape (layers + 1, hidden_dim), got "
+            f"shape {tuple(steering_vectors.shape)}. The vLLM ProjectionCache "
+            "path is rank-1 only; use backend='hf' for multi-direction, SOM, "
+            "SAE, harmfulness-pair, or iterative recipes."
+        )
+
 
 # MLA-bearing model architecture name fragments. When the model's HF
 # ``config.architectures`` contains any of these substrings, we pick an
@@ -74,10 +87,116 @@ _SINK_ATTENTION_ARCH_FRAGMENTS: tuple[str, ...] = (
     "GptOss",  # gpt-oss-20b / 120b
 )
 
+# Common Hugging Face architecture fragments for mixture-of-experts models.
+# This is only the fallback when config-field detection is unavailable; the
+# engine-init path passes the result of inspecting the actual HF config.
+_MOE_ARCH_FRAGMENTS: tuple[str, ...] = (
+    "Dbrx",
+    "DeepseekV2",
+    "DeepseekV3",
+    "DeepseekV4",
+    "GptOss",
+    "MiniMaxM2",
+    "MiniMaxText",
+    "Mixtral",
+    "Moe",
+    "MoE",
+    "Olmoe",
+)
 
-def _detect_arch_family(model_id: str, trust_remote_code: bool) -> str:
-    """Return the first architecture name from the model's HF config, or
-    an empty string if the config can't be loaded.
+_MOE_CONFIG_FIELDS: tuple[str, ...] = (
+    "num_experts",
+    "num_local_experts",
+    "num_routed_experts",
+    "n_routed_experts",
+    "moe_num_experts",
+    "num_experts_per_tok",
+)
+
+_MOE_CONFIG_CHILDREN: tuple[str, ...] = (
+    "text_config",
+    "decoder_config",
+    "ffn_config",
+)
+
+
+def _architecture_looks_moe(model_arch: str) -> bool:
+    """Return whether an architecture name is recognisably MoE."""
+    return any(fragment in model_arch for fragment in _MOE_ARCH_FRAGMENTS)
+
+
+def _config_looks_moe(hf_config: Any, model_arch: str) -> bool:
+    """Inspect common HF MoE topology fields, including nested configs."""
+    pending = [hf_config]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+
+        for field in _MOE_CONFIG_FIELDS:
+            value = (
+                candidate.get(field)
+                if isinstance(candidate, dict)
+                else getattr(candidate, field, None)
+            )
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if value > 0:
+                    return True
+
+        for child_name in _MOE_CONFIG_CHILDREN:
+            child = (
+                candidate.get(child_name)
+                if isinstance(candidate, dict)
+                else getattr(candidate, child_name, None)
+            )
+            if child is not None:
+                pending.append(child)
+
+    return _architecture_looks_moe(model_arch)
+
+
+def _resolve_return_routed_experts(
+    configured: bool | None,
+    *,
+    model_arch: str,
+    is_moe: bool | None,
+) -> bool:
+    """Resolve routed-expert capture while preserving explicit overrides.
+
+    ``None`` is the safe auto mode: use inspected HF topology when available,
+    then fall back to the architecture name. Dense/unknown models stay off.
+    """
+    if configured is not None:
+        return configured
+    if is_moe is not None:
+        return is_moe
+    return _architecture_looks_moe(model_arch)
+
+
+def _resolve_expert_parallel(
+    configured: bool | None,
+    *,
+    model_arch: str,
+    is_moe: bool | None,
+) -> bool:
+    """Enable EP only for MoE topology and reject impossible overrides."""
+    topology_is_moe = (
+        is_moe if is_moe is not None else _architecture_looks_moe(model_arch)
+    )
+    if configured is None:
+        return topology_is_moe
+    if configured and not topology_is_moe:
+        raise ValueError(
+            "vLLM expert parallelism was explicitly enabled for a dense model; "
+            "set model.enable_expert_parallel=false (or leave it unset for auto)."
+        )
+    return configured
+
+
+def _detect_model_metadata(model_id: str, trust_remote_code: bool) -> tuple[str, bool]:
+    """Return ``(architecture, is_moe)`` from the model's HF config.
 
     A failure here means MLA-aware backend selection silently degrades to
     "let vLLM pick", which on an MLA model can crash the engine init the
@@ -96,9 +215,16 @@ def _detect_arch_family(model_id: str, trust_remote_code: bool) -> str:
             "MiniMax-M2.x), set ``attention_backend`` explicitly in the "
             "[model] config to avoid an engine-init crash.[/]"
         )
-        return ""
+        return "", False
     archs = getattr(cfg, "architectures", None) or []
-    return archs[0] if archs else ""
+    model_arch = archs[0] if archs else ""
+    return model_arch, _config_looks_moe(cfg, model_arch)
+
+
+def _detect_arch_family(model_id: str, trust_remote_code: bool) -> str:
+    """Backward-compatible architecture-only view of model metadata."""
+    model_arch, _ = _detect_model_metadata(model_id, trust_remote_code)
+    return model_arch
 
 
 def _resolve_compile_mode(enforce_eager_legacy: bool, vllm_compile_mode: str) -> str:
@@ -178,6 +304,7 @@ def _build_llm_kwargs(
     is_fp8: bool,
     kv_cache_dtype: str | None,
     lora_max_rank: int,
+    is_moe: bool | None = None,
 ) -> dict[str, Any]:
     """Pure function that assembles the dict passed to ``vllm.LLM(...)``.
 
@@ -202,7 +329,11 @@ def _build_llm_kwargs(
         tensor_parallel_size=tp,
         gpu_memory_utilization=config.model.gpu_memory_utilization,
         trust_remote_code=config.model.trust_remote_code or False,
-        enable_expert_parallel=config.model.enable_expert_parallel,
+        enable_expert_parallel=_resolve_expert_parallel(
+            config.model.enable_expert_parallel,
+            model_arch=model_arch,
+            is_moe=is_moe,
+        ),
         # MoE compute backend. Default 'triton' avoids the FlashInfer
         # cutlass per-expert-group JIT compile that costs ~30 minutes
         # on first sm_90 cold start.
@@ -220,7 +351,14 @@ def _build_llm_kwargs(
         # (~140 KB per typical request); the win is dropping ~150 LoC of
         # worker rpc plumbing + one of the two reasons we needed
         # VLLM_ALLOW_INSECURE_SERIALIZATION.
-        enable_return_routed_experts=config.model.vllm_return_routed_experts,
+        # Auto-enable only for MoE topology. vLLM 0.20.x tries to read MoE-only
+        # config fields during startup when this is True, which crashes dense
+        # models. An explicit recipe True/False remains authoritative.
+        enable_return_routed_experts=_resolve_return_routed_experts(
+            config.model.vllm_return_routed_experts,
+            model_arch=model_arch,
+            is_moe=is_moe,
+        ),
         # vLLM 0.20.x compilation_config encodes the eager/non-eager
         # intent. ``enforce_eager`` is intentionally NOT passed here —
         # _resolve_compile_mode folds it into ``compile_mode`` above so
@@ -361,7 +499,7 @@ class VLLMGenerator:
 
         # Architecture sniff drives the MLA-aware attention backend choice
         # below. Cached so we only hit the HF config once.
-        model_arch = _detect_arch_family(model_id, trust)
+        model_arch, is_moe = _detect_model_metadata(model_id, trust)
 
         print(f"* Loading model in vLLM with TP={tp}...")
 
@@ -388,6 +526,7 @@ class VLLMGenerator:
             is_fp8=is_fp8,
             kv_cache_dtype=kv_cache_dtype,
             lora_max_rank=self._lora_max_rank,
+            is_moe=is_moe,
         )
 
         self.llm = LLM(**kwargs)
@@ -709,6 +848,18 @@ class VLLMGenerator:
             # the rank passed through honestly should set
             # ``vllm_max_lora_rank = <actual_rank>`` in the model config.
             rank = lora_a.shape[0]
+            if lora_b.shape[1] != rank:
+                raise ValueError(
+                    f"LoRA rank mismatch for {module_path}: lora_A has rank "
+                    f"{rank}, lora_B has rank {lora_b.shape[1]}."
+                )
+            if rank > target_rank:
+                raise ValueError(
+                    f"Adapter {module_path} has rank {rank}, which exceeds "
+                    f"the vLLM engine max_lora_rank={target_rank}. Set "
+                    "model.vllm_max_lora_rank to a supported capacity before "
+                    "constructing VLLMGenerator."
+                )
             if rank < target_rank:
                 pad = target_rank - rank
                 lora_a = F.pad(lora_a, (0, 0, 0, pad))
@@ -830,22 +981,24 @@ class VLLMGenerator:
     ) -> tuple[list[str], Tensor]:
         """Generate responses AND capture logprobs for KL divergence.
 
-        Under vLLM V1, **sampler logprobs returned by the generation loop
-        are unreliable** when weights are edited in place via
-        ``collective_rpc`` — they read effectively identical across
-        baseline/edited weights even with ``enable_prefix_caching=False``.
-        The cache that matters here isn't the block-pool prefix cache but
-        something in the logprobs collection path (possibly the sampler's
-        own CUDA-level cache).
+        Ordinary LoRA/model runs use sampler logprobs for the generated
+        tokens. ``prompt_logprobs[-1]`` predicts the final *prompt* token and
+        is therefore not a next-token KL signal.
 
-        Our fallback: read ``prompt_logprobs[-1]`` (next-token distribution
-        computed during prefill at the final prompt position).  Prefill is
-        always fresh against the current weights, so this gives a real KL
-        signal.  Long-form generation drift is captured by
-        ``scorer.measure_coherence`` (length_deviation), which is summed
-        into the divergence objective with weight 0.5.
+        vLLM V1 sampler logprobs may be stale after ``collective_rpc``
+        in-place edits. That mode is scored separately through
+        :meth:`score_continuations_nll`; it must not silently substitute a
+        prompt-token distribution and call it the same KL metric.
         """
         prompts = self._format_prompts(messages)
+
+        if kl_token_count < 1:
+            raise ValueError("kl_token_count must be at least 1")
+        if kl_token_count > max_new_tokens:
+            raise ValueError(
+                f"kl_token_count ({kl_token_count}) cannot exceed "
+                f"max_new_tokens ({max_new_tokens})"
+            )
 
         k_logprobs = 100
 
@@ -853,18 +1006,17 @@ class VLLMGenerator:
             "temperature": 0.0,
             "max_tokens": max_new_tokens,
             "logprobs": k_logprobs,
-            # Capture next-token distribution at every prompt position so we
-            # can read prompt_logprobs[-1] as the KL signal.  Sampler
-            # logprobs in V1 can read stale across in-place weight edits.
-            "prompt_logprobs": k_logprobs,
         }
-        if min_new_tokens is not None:
-            if min_new_tokens > max_new_tokens:
-                raise ValueError(
-                    f"min_gen_tokens ({min_new_tokens}) cannot exceed "
-                    f"max_gen_tokens ({max_new_tokens})"
-                )
-            sampling_kwargs["min_tokens"] = min_new_tokens
+        requested_min_tokens = max(min_new_tokens or 0, kl_token_count)
+        if requested_min_tokens > max_new_tokens:
+            raise ValueError(
+                f"min_gen_tokens ({requested_min_tokens}) cannot exceed "
+                f"max_gen_tokens ({max_new_tokens})"
+            )
+        # vLLM should return a sampler distribution for every KL step even if
+        # it samples EOS immediately. The padding below remains a defensive
+        # contract for malformed/older RequestOutput implementations.
+        sampling_kwargs["min_tokens"] = requested_min_tokens
 
         params = self._SamplingParams(**sampling_kwargs)
 
@@ -881,60 +1033,44 @@ class VLLMGenerator:
         outputs = self.llm.generate(prompts, params, lora_request=lora_req)
 
         responses: list[str] = []
-        all_logprobs: list[Tensor] = []
 
         vocab_size = self.llm.llm_engine.model_config.get_vocab_size()
         import math
 
         uniform_lp = math.log(1.0 / vocab_size)
+        # Allocate and normalize once for the entire request. The previous
+        # implementation created a full-vocabulary tensor and ran log_softmax
+        # separately for every batch item and KL step. At 150k vocabulary and
+        # batch 64 that Python/allocation overhead dominated vLLM inference.
+        dense_logprobs = torch.full(
+            (len(outputs), kl_token_count, vocab_size),
+            -30.0,
+            dtype=torch.float32,
+        )
+        has_finite = torch.zeros(
+            (len(outputs), kl_token_count),
+            dtype=torch.bool,
+        )
 
-        def _safe_sparse_logprobs(sparse_lps: dict[int, Any]) -> Tensor:
-            step_vec = torch.full((vocab_size,), -30.0)
-            found_finite = False
-            for token_id, logprob_obj in sparse_lps.items():
-                lp = float(logprob_obj.logprob)
-                if not math.isfinite(lp):
-                    continue
-                step_vec[int(token_id)] = lp
-                found_finite = True
-            if not found_finite:
-                return torch.full((vocab_size,), uniform_lp)
-            log_vec = F.log_softmax(step_vec, dim=0)
-            if not torch.isfinite(log_vec).all():
-                return torch.full((vocab_size,), uniform_lp)
-            return log_vec
-
-        for out in outputs:
+        for batch_idx, out in enumerate(outputs):
             responses.append(out.outputs[0].text)
 
-            # Prefer prompt_logprobs[-1] (fresh prefill, reliable under
-            # in-place editing).  Walk back to skip any trailing None entries.
-            sparse_lps: dict[int, Any] | None = None
-            p_lps = getattr(out, "prompt_logprobs", None)
-            if p_lps:
-                for entry in reversed(p_lps):
-                    if entry:
-                        sparse_lps = entry
-                        break
+            token_lps = out.outputs[0].logprobs or []
+            n_tokens = min(kl_token_count, len(token_lps))
+            for step_idx, sparse_lps in enumerate(token_lps[:n_tokens]):
+                for token_id, logprob_obj in (sparse_lps or {}).items():
+                    lp = float(logprob_obj.logprob)
+                    token_idx = int(token_id)
+                    if not math.isfinite(lp) or not 0 <= token_idx < vocab_size:
+                        continue
+                    dense_logprobs[batch_idx, step_idx, token_idx] = lp
+                    has_finite[batch_idx, step_idx] = True
 
-            # Fallback to generation logprobs only if prefill didn't
-            # produce any — shouldn't happen in normal operation.
-            if sparse_lps is None:
-                token_lps = out.outputs[0].logprobs or []
-                n_tokens = min(kl_token_count, len(token_lps))
-                if n_tokens == 0:
-                    all_logprobs.append(torch.full((vocab_size,), uniform_lp))
-                    continue
-                per_step: list[Tensor] = []
-                for step_lps in token_lps[:n_tokens]:
-                    per_step.append(_safe_sparse_logprobs(step_lps))
-                all_logprobs.append(torch.stack(per_step).mean(dim=0))
-                continue
-
-            # Build sparse log-softmax vector from prompt_logprobs[-1].
-            all_logprobs.append(_safe_sparse_logprobs(sparse_lps))
-
-        return responses, torch.stack(all_logprobs)
+        dense_logprobs = F.log_softmax(dense_logprobs, dim=-1)
+        dense_logprobs[~has_finite] = uniform_lp
+        if kl_token_count == 1:
+            dense_logprobs = dense_logprobs[:, 0, :]
+        return responses, dense_logprobs
 
     def generate_and_score_batched(
         self,
@@ -972,6 +1108,160 @@ class VLLMGenerator:
         )
         return logprobs
 
+    def _prepare_continuation_prompts(
+        self,
+        messages: list[ChatMessage],
+        continuations: list[str],
+    ) -> tuple[list[str], list[list[int]]]:
+        """Format fixed continuations and locate their first token."""
+        if len(messages) != len(continuations):
+            raise ValueError(
+                "messages and continuations must have the same length "
+                f"({len(messages)} != {len(continuations)})"
+            )
+
+        prompts = self._format_prompts(messages)
+        full_prompts = [p + c for p, c in zip(prompts, continuations)]
+        prompt_token_ids: list[list[int]] = []
+        for prompt in prompts:
+            try:
+                token_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+            except TypeError:
+                token_ids = self.tokenizer.encode(prompt)
+            prompt_token_ids.append(list(token_ids))
+        return full_prompts, prompt_token_ids
+
+    @staticmethod
+    def _continuation_start(
+        item_idx: int,
+        expected_prompt_ids: list[int],
+        full_prompt_token_ids: list[int],
+    ) -> int:
+        """Validate and return the first unambiguous continuation position."""
+        if not expected_prompt_ids:
+            raise ValueError(
+                f"Prompt item {item_idx} has no tokens; vLLM cannot align "
+                "the first continuation distribution"
+            )
+        if full_prompt_token_ids[: len(expected_prompt_ids)] != expected_prompt_ids:
+            raise ValueError(
+                f"Continuation item {item_idx} changes the prompt token boundary; "
+                "teacher-forced continuation positions are ambiguous"
+            )
+        return len(expected_prompt_ids)
+
+    def score_continuation_logprobs_batched(
+        self,
+        messages: list[ChatMessage],
+        continuations: list[str],
+        token_count: int,
+        adapter_path: str | None = None,
+    ) -> Tensor:
+        """Capture distributions on shared teacher-forced continuations.
+
+        The returned distributions predict the first ``token_count`` tokens
+        of each fixed continuation.  Baseline and edited model calls therefore
+        see identical prefixes at every KL step, unlike free-running sampler
+        logprobs whose prefixes can diverge after the first generated token.
+
+        Returns ``(batch, vocab)`` for one token and
+        ``(batch, token_count, vocab)`` for multiple tokens.
+        """
+        if token_count < 1:
+            raise ValueError("token_count must be at least 1")
+
+        full_prompts, expected_prompt_ids = self._prepare_continuation_prompts(
+            messages, continuations
+        )
+
+        params = self._SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            prompt_logprobs=100,
+        )
+
+        lora_req = None
+        if adapter_path and not self._lora_disabled:
+            from vllm.lora.request import LoRARequest
+
+            lora_req = LoRARequest(
+                f"steering_{self._adapter_id}",
+                self._adapter_id,
+                adapter_path,
+            )
+
+        outputs = self.llm.generate(full_prompts, params, lora_request=lora_req)
+        if len(outputs) != len(messages):
+            raise RuntimeError(
+                "vLLM returned an unexpected number of continuation scores "
+                f"({len(outputs)} != {len(messages)})"
+            )
+
+        vocab_size = self.llm.llm_engine.model_config.get_vocab_size()
+        dense_logprobs = torch.full(
+            (len(outputs), token_count, vocab_size),
+            -30.0,
+            dtype=torch.float32,
+        )
+
+        for batch_idx, (out, expected_ids) in enumerate(
+            zip(outputs, expected_prompt_ids)
+        ):
+            prompt_token_ids = list(getattr(out, "prompt_token_ids", None) or [])
+            prompt_logprobs = list(getattr(out, "prompt_logprobs", None) or [])
+            if not prompt_token_ids or not prompt_logprobs:
+                raise RuntimeError(
+                    "vLLM did not return prompt token IDs and prompt logprobs "
+                    f"for continuation item {batch_idx}"
+                )
+
+            # Match score_continuations_nll: the prompt's separately-tokenized
+            # length marks the first continuation token in the full prompt.
+            start = self._continuation_start(
+                batch_idx,
+                expected_ids,
+                prompt_token_ids,
+            )
+            stop = start + token_count
+            if stop > len(prompt_token_ids):
+                available = max(len(prompt_token_ids) - start, 0)
+                raise ValueError(
+                    f"Continuation item {batch_idx} has only {available} token(s); "
+                    f"token_count={token_count} requires at least {token_count}"
+                )
+            if stop > len(prompt_logprobs):
+                raise RuntimeError(
+                    "vLLM returned too few prompt-logprob positions for "
+                    f"continuation item {batch_idx}: need {stop}, got "
+                    f"{len(prompt_logprobs)}"
+                )
+
+            for step_idx, position in enumerate(range(start, stop)):
+                sparse_lps = prompt_logprobs[position]
+                if not sparse_lps:
+                    raise RuntimeError(
+                        "vLLM returned no prompt-logprob distribution for "
+                        f"continuation item {batch_idx}, step {step_idx}"
+                    )
+                found_finite = False
+                for token_id, logprob_obj in sparse_lps.items():
+                    lp = float(logprob_obj.logprob)
+                    token_idx = int(token_id)
+                    if not math.isfinite(lp) or not 0 <= token_idx < vocab_size:
+                        continue
+                    dense_logprobs[batch_idx, step_idx, token_idx] = lp
+                    found_finite = True
+                if not found_finite:
+                    raise RuntimeError(
+                        "vLLM returned no finite prompt logprobs for "
+                        f"continuation item {batch_idx}, step {step_idx}"
+                    )
+
+        dense_logprobs = F.log_softmax(dense_logprobs, dim=-1)
+        if token_count == 1:
+            return dense_logprobs[:, 0, :]
+        return dense_logprobs
+
     def score_continuations_nll(
         self,
         messages: list[ChatMessage],
@@ -990,22 +1280,9 @@ class VLLMGenerator:
         ``(batch,)``.  Missing token logprobs are floored at 30 nats, which is
         conservative and finite for heavily damaged trials.
         """
-        if len(messages) != len(continuations):
-            raise ValueError(
-                "messages and continuations must have the same length "
-                f"({len(messages)} != {len(continuations)})"
-            )
-
-        prompts = self._format_prompts(messages)
-        full_prompts = [p + c for p, c in zip(prompts, continuations)]
-
-        prompt_lens: list[int] = []
-        for prompt in prompts:
-            try:
-                token_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-            except TypeError:
-                token_ids = self.tokenizer.encode(prompt)
-            prompt_lens.append(len(token_ids))
+        full_prompts, expected_prompt_ids = self._prepare_continuation_prompts(
+            messages, continuations
+        )
 
         params = self._SamplingParams(
             temperature=0.0,
@@ -1026,14 +1303,20 @@ class VLLMGenerator:
         outputs = self.llm.generate(full_prompts, params, lora_request=lora_req)
 
         nlls: list[Tensor] = []
-        for out, prompt_len in zip(outputs, prompt_lens):
+        for batch_idx, (out, expected_ids) in enumerate(
+            zip(outputs, expected_prompt_ids)
+        ):
             prompt_token_ids = list(getattr(out, "prompt_token_ids", None) or [])
             prompt_logprobs = list(getattr(out, "prompt_logprobs", None) or [])
             if not prompt_token_ids or not prompt_logprobs:
                 nlls.append(torch.tensor(30.0))
                 continue
 
-            start = min(max(prompt_len, 1), len(prompt_token_ids))
+            start = self._continuation_start(
+                batch_idx,
+                expected_ids,
+                prompt_token_ids,
+            )
             losses: list[float] = []
             for idx in range(start, len(prompt_token_ids)):
                 if idx >= len(prompt_logprobs):
@@ -1092,6 +1375,10 @@ class ProjectionCache:
         For MiniMax-M2.5 (256 experts × 62 layers), this reads ~15,872 weight
         tensors but only keeps one in memory at a time.
         """
+        _require_single_direction_vectors(
+            steering_vectors, operation="ProjectionCache.build_from_safetensors"
+        )
+
         import json as _json
         import re
         from pathlib import Path
@@ -1436,6 +1723,10 @@ class ProjectionCache:
            = \\frac{(1-f)\\,(\\text{sv}[a] @ W) + f\\,(\\text{sv}[a+1] @ W)}
                   {\\|(1-f)\\,\\text{sv}[a] + f\\,\\text{sv}[a+1]\\|}
         """
+        _require_single_direction_vectors(
+            steering_vectors, operation="ProjectionCache.build"
+        )
+
         from .steering import _dequantize_fp8_blockwise, _FP8_DTYPES
 
         cache = ProjectionCache()
@@ -1593,6 +1884,9 @@ class ProjectionCache:
         kernel = config.steering.decay_kernel
         sv = self.steering_vectors
         assert sv is not None
+        _require_single_direction_vectors(
+            sv, operation="ProjectionCache.build_lora_weights"
+        )
 
         # Resolve global vector indices if applicable.
         # For global mode we reconstruct v_global @ W exactly using linearity:

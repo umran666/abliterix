@@ -4,7 +4,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Steering algorithm: modify model weights via LoRA rank-1 updates.
+"""Steering algorithm: modify model weights via low-rank LoRA updates.
 
 This module implements the core steering (abliteration) procedure as a
 standalone function rather than a method on the engine, keeping the algorithm
@@ -116,62 +116,91 @@ def _detect_discriminative_layers(
     return discriminative
 
 
+def _rotate_toward_removal(
+    h: Tensor,
+    direction: Tensor,
+    fraction: float,
+) -> Tensor:
+    """Geodesically rotate ``h`` toward the equator orthogonal to a direction."""
+    if fraction == 0.0:
+        return h
+
+    d = direction.to(h.device, dtype=h.dtype)
+    if d.norm() == 0:
+        return h
+    d = F.normalize(d, p=2, dim=0)
+
+    raw_h_norm = h.norm(dim=-1, keepdim=True)
+    h_norm = raw_h_norm.clamp(min=1e-8)
+    h_hat = h / h_norm
+    projection = (h_hat @ d).unsqueeze(-1).clamp(-1.0, 1.0)
+    residual = h_hat - projection * d
+    residual_norm = residual.norm(dim=-1, keepdim=True)
+    removal_tangent = residual / residual_norm.clamp(min=1e-8)
+
+    # Parallel activations do not define a unique great circle.  Pick a
+    # deterministic orthogonal tangent by projecting the least-aligned
+    # coordinate axis off the steering direction.
+    fallback_axis = torch.zeros_like(d)
+    fallback_axis[d.abs().argmin()] = 1
+    fallback_tangent = F.normalize(
+        fallback_axis - (fallback_axis @ d) * d,
+        p=2,
+        dim=0,
+    )
+    removal_tangent = torch.where(
+        residual_norm <= 1e-6,
+        fallback_tangent,
+        removal_tangent,
+    )
+
+    # h_hat = sign(p) sin(alpha) d + cos(alpha) tangent.  Reducing alpha
+    # toward zero removes the directional component without crossing the
+    # tangent or inverting the activation.
+    alpha = torch.atan2(projection.abs(), residual_norm)
+    remaining = (1.0 - fraction) * alpha
+    h_hat_new = (
+        projection.sign() * torch.sin(remaining) * d
+        + torch.cos(remaining) * removal_tangent
+    )
+    return torch.where(raw_h_norm == 0, h, h_norm * h_hat_new)
+
+
 def _make_angular_hook(
     direction: Tensor,
     angle_degrees: float,
     adaptive: bool = False,
 ):
-    """Create a forward hook that rotates activations within the steering plane.
+    """Create a forward hook that rotates activations toward removal.
 
-    Implements Angular Steering (NeurIPS 2025 Spotlight):
-        h_steered = h - proj_P(h) + |proj_P(h)| * [b1 b2] R_θ [1 0]^T
+    Abliterix has one direction per layer rather than the paper's second fixed
+    plane basis.  It therefore uses the uniquely defined plane spanned by each
+    activation and ``direction``, with a bounded rotation toward the
+    direction-orthogonal removal tangent.
 
     Parameters
     ----------
     direction : Tensor
-        Unit-normalised steering direction (hidden_dim,).
+        Steering direction (hidden_dim,).  It is normalised by the hook.
     angle_degrees : float
-        Rotation angle.  ~200° = compliance, ~20° = refusal.
+        Rotation budget clamped to ``[0, 90]`` degrees.  Zero is identity;
+        90 degrees is full directional removal.
     adaptive : bool
         If True, only rotate activations positively aligned with the
         direction (Adaptive Angular Steering), reducing interference.
     """
-    theta = math.radians(angle_degrees)
-    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    fraction = min(max(angle_degrees / 90.0, 0.0), 1.0)
 
     def hook(module, input, output):
         h = output
         if isinstance(h, tuple):
             h = h[0]
 
-        d = direction.to(h.device, dtype=h.dtype)
-
-        # b1 = d (first basis vector of the 2D steering plane).
-        # Scalar projection of h onto d.
-        proj_scalar = (h @ d).unsqueeze(-1)  # (..., seq, 1)
-        proj_on_d = proj_scalar * d  # component along b1
-
-        # b2 = Gram-Schmidt orthogonal complement within the plane.
-        residual = h - proj_on_d
-        residual_norm = residual.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        b2 = residual / residual_norm
-
-        # The 2D projection has components (proj_scalar, residual_norm).
-        # Its magnitude is preserved by rotation.
-        # Rotate: new_b1_coeff = cos(θ)*proj_scalar + sin(θ)*residual_norm
-        #         new_b2_coeff = -sin(θ)*proj_scalar + cos(θ)*residual_norm
-        new_proj_on_d = (cos_t * proj_scalar + sin_t * residual_norm) * d
-        new_residual = (-sin_t * proj_scalar + cos_t * residual_norm) * b2
-
-        # Components outside the 2D plane are preserved.
-        # h = proj_on_d + residual + h_perp  →  h_perp = h - proj_on_d - residual
-        # But residual = residual_norm * b2, so h_perp is everything else.
-        # Since we only computed b2 from residual, there's nothing outside;
-        # the full h is reconstructed as new_proj_on_d + new_residual.
-        h_new = new_proj_on_d + new_residual
+        h_new = _rotate_toward_removal(h, direction, fraction)
 
         if adaptive:
-            mask = (proj_scalar > 0).to(h_new.dtype)
+            d = F.normalize(direction.to(h.device, dtype=h.dtype), p=2, dim=0)
+            mask = ((h @ d).unsqueeze(-1) > 0).to(h_new.dtype)
             h_new = mask * h_new + (1 - mask) * h
 
         if isinstance(output, tuple):
@@ -192,7 +221,7 @@ def apply_steering(
     benign_states: Tensor | None = None,
     target_states: Tensor | None = None,
 ):
-    """Apply rank-1 LoRA steering to every steerable module in the model.
+    """Apply rank-k LoRA steering to every steerable module in the model.
 
     Parameters
     ----------
@@ -200,7 +229,9 @@ def apply_steering(
         The loaded model wrapper (provides ``transformer_layers``,
         ``steerable_modules``, adapter access, and helper methods).
     steering_vectors : Tensor
-        Per-layer vectors of shape ``(layers+1, hidden_dim)``.
+        Per-layer vectors of shape ``(layers+1, hidden_dim)``, or a
+        multi-direction subspace of shape
+        ``(n_directions, layers+1, hidden_dim)``.
     vector_index : float or None
         If not None, interpolate a global vector from two adjacent layers.
         If None, use per-layer vectors.
@@ -222,6 +253,35 @@ def apply_steering(
         config = engine.config
 
     steering_mode = config.steering.steering_mode
+
+    if steering_vectors.ndim == 3:
+        runtime_hook_modes = {
+            SteeringMode.ANGULAR,
+            SteeringMode.ADAPTIVE_ANGULAR,
+            SteeringMode.SPHERICAL,
+            SteeringMode.VECTOR_FIELD,
+        }
+        if steering_mode in runtime_hook_modes:
+            raise ValueError(
+                f"Multi-direction steering is not implemented for runtime hook "
+                f"mode {steering_mode.value!r}; use LoRA or dense direct mode."
+            )
+        if steering_mode == SteeringMode.DIRECT and engine.has_expert_routing():
+            raise ValueError(
+                "Multi-direction direct MoE steering is not yet supported: "
+                "the EGA expert path accepts one direction per layer. Use a "
+                "single direction or LoRA without expert routing."
+            )
+
+    # The legacy HF MoE path below accepts one residual direction per layer.
+    # Reject rank-k tensors before either LoRA adapters or router/expert weights
+    # are touched; otherwise the later layer lookup indexes the direction axis
+    # and can fail after the LoRA update has already been committed.
+    if steering_vectors.ndim == 3 and safety_experts and routing_config is not None:
+        raise ValueError(
+            "Multi-direction steering with HF MoE expert routing is not yet "
+            "supported; disable expert routing or use a single direction."
+        )
 
     # --- Discriminative layer selection -----------------------------------
     discriminative_layers: set[int] | None = None
@@ -345,6 +405,7 @@ def apply_steering(
 
     # --- Per-layer, per-component steering --------------------------------
     kernel = config.steering.decay_kernel
+    adapter_updates: list[tuple[Tensor, Tensor, Tensor, Tensor]] = []
 
     for layer_idx in range(len(engine.transformer_layers)):
         # Skip non-discriminative layers when the feature is enabled.
@@ -388,7 +449,14 @@ def apply_steering(
 
                 device = mod.weight.device
                 if global_vector is None:
-                    v = sv_by_device[device][layer_idx + 1]
+                    if steering_vectors.ndim == 3:
+                        # Multi-direction vectors are laid out as
+                        # (n_directions, layers + 1, hidden_dim).  Keep the
+                        # direction axis intact so each direction occupies one
+                        # LoRA rank instead of flattening directions/layers.
+                        v = sv_by_device[device][:, layer_idx + 1, :]
+                    else:
+                        v = sv_by_device[device][layer_idx + 1]
                 else:
                     v = gv_by_device[device]  # ty:ignore[non-subscriptable]
 
@@ -462,16 +530,17 @@ def apply_steering(
 
                 W = W.view(W.shape[0], -1)
 
-                # Shape guard: the steering vector `v` has shape (1, hidden).
-                # For the `v @ W` projection below to be well-defined, we need
-                # `W.shape[0] == hidden` — i.e. the module's output dim must
-                # match the residual stream. Modules with asymmetric output
-                # (GQA q/k/v_proj, MoE routers with shape (num_experts, hidden),
-                # GatedDeltaNet `linear_attn.out_proj` with head_dim-sized
-                # outputs, …) cannot accept a rank-1 hidden-stream update and
-                # must be skipped. Without this guard a mis-registered module
-                # crashes the trial loop at `v @ W`.
-                if W.shape[0] != v.shape[-1]:
+                # Keep one row per steering direction. Residual-sized outputs
+                # use the historical output-side projection. Asymmetric GQA
+                # K/V matrices have residual-sized inputs instead, so project
+                # their input space rather than silently skipping them.
+                V = v.unsqueeze(0) if v.ndim == 1 else v
+                hidden_dim = V.shape[-1]
+                if W.shape[0] == hidden_dim:
+                    projection_side = "output"
+                elif W.shape[1] == hidden_dim:
+                    projection_side = "input"
+                else:
                     continue
 
                 # Optional row normalisation before computing the adapter.
@@ -481,17 +550,47 @@ def apply_steering(
                     W_row_norms = LA.vector_norm(W, dim=1, keepdim=True)
                     W = F.normalize(W, p=2, dim=1)
 
-                # Rank-1 steering: project W onto the orthogonal complement of v.
-                #   lora_A  =  vᵀ W    (shape 1 × d_in)
-                #   lora_B  = -λ v      (shape d_out × 1)
-                lora_A = (v @ W).view(1, -1)
-                lora_B = (-strength * v).view(-1, 1)
+                # Rank-k steering stacks one update per direction.
+                # Output-side (d_out == hidden): ΔW = -λ Vᵀ V W.
+                # Input-side  (d_in  == hidden): ΔW = -λ W Vᵀ V.
+
+                # Validate capacity against the requested steering subspace
+                # before FULL normalisation can compress the update with SVD.
+                # Otherwise a rank-r approximation could silently accept k>r
+                # directions and make the configured multi-direction contract
+                # impossible to represent.
+                wA = cast(Tensor, mod.lora_A["default"].weight)
+                wB = cast(Tensor, mod.lora_B["default"].weight)
+                direction_rank = V.shape[0]
+                if wA.shape[0] < direction_rank or wB.shape[1] < direction_rank:
+                    raise ValueError(
+                        "LoRA adapter rank is too small for steering subspace: "
+                        f"need rank >= {direction_rank}, got A{tuple(wA.shape)} "
+                        f"and B{tuple(wB.shape)}"
+                    )
+                if (
+                    wA.shape[0] != wB.shape[1]
+                    or wA.shape[1] != W.shape[1]
+                    or wB.shape[0] != W.shape[0]
+                ):
+                    raise ValueError(
+                        "LoRA adapter dimensions do not match base weight: "
+                        f"adapter A{tuple(wA.shape)}, B{tuple(wB.shape)}; "
+                        f"base weight {tuple(W.shape)}"
+                    )
+
+                if projection_side == "output":
+                    lora_A = V @ W
+                    lora_B = -strength * V.T
+                else:
+                    lora_A = V
+                    lora_B = -strength * (W @ V.T)
 
                 if norm_mode == WeightNorm.PRE:
                     lora_B = W_row_norms * lora_B
                 elif norm_mode == WeightNorm.FULL:
                     # Low-rank SVD approximation that preserves original row
-                    # magnitudes after the rank-1 update.
+                    # magnitudes after the rank-k update.
                     W = W + lora_B @ lora_A
                     W = F.normalize(W, p=2, dim=1)
                     W = W * W_row_norms
@@ -511,10 +610,47 @@ def apply_steering(
                     lora_A = torch.diag(sqrt_S) @ Vh
 
                 # Write the adapter weights (PEFT default adapter name).
-                wA = cast(Tensor, mod.lora_A["default"].weight)
-                wB = cast(Tensor, mod.lora_B["default"].weight)
-                wA.data = lora_A.to(wA.dtype)
-                wB.data = lora_B.to(wB.dtype)
+                required_rank = lora_A.shape[0]
+                if wA.shape[0] < required_rank or wB.shape[1] < required_rank:
+                    raise ValueError(
+                        "LoRA adapter rank is too small for steering subspace: "
+                        f"need rank >= {required_rank}, got A{tuple(wA.shape)} "
+                        f"and B{tuple(wB.shape)}"
+                    )
+                if wA.shape[1] != lora_A.shape[1] or wB.shape[0] != lora_B.shape[0]:
+                    raise ValueError(
+                        "LoRA adapter dimensions do not match steering update: "
+                        f"adapter A{tuple(wA.shape)}, B{tuple(wB.shape)}; "
+                        f"update A{tuple(lora_A.shape)}, B{tuple(lora_B.shape)}"
+                    )
+
+                # Preserve the PEFT Parameter objects and their declared rank.
+                # Extra capacity is zero-filled when adapter rank > k.
+                new_A = torch.zeros_like(wA)
+                new_B = torch.zeros_like(wB)
+                new_A[:required_rank].copy_(lora_A.to(wA.dtype))
+                new_B[:, :required_rank].copy_(lora_B.to(wB.dtype))
+                adapter_updates.append((wA, wB, new_A, new_B))
+
+    # Commit only after every target module has been computed and validated.
+    # This keeps a rejected trial from leaving earlier adapters partially
+    # steered.  The rollback also covers the unlikely case of a failed device
+    # copy during the commit itself.
+    originals = [
+        (wA, wB, wA.detach().clone(), wB.detach().clone())
+        for wA, wB, _new_A, _new_B in adapter_updates
+    ]
+    try:
+        with torch.no_grad():
+            for wA, wB, new_A, new_B in adapter_updates:
+                wA.copy_(new_A)
+                wB.copy_(new_B)
+    except Exception:
+        with torch.no_grad():
+            for wA, wB, original_A, original_B in originals:
+                wA.copy_(original_A)
+                wB.copy_(original_B)
+        raise
 
     # --- MoE expert-level steering ----------------------------------------
     if safety_experts and routing_config:
@@ -1136,8 +1272,9 @@ def _apply_angular_steering(
         else:  # LINEAR
             strength = sp.max_weight + t * (sp.min_weight - sp.max_weight)
 
-        # Map strength to rotation angle.  strength=1.0 → 180° (full inversion).
-        angle = strength * 180.0
+        # Strength is the fraction of full directional removal.  The hook
+        # clamps values above 1.0 at the 90° removal tangent.
+        angle = strength * 90.0
 
         if global_vector is None:
             v = steering_vectors[layer_idx + 1]
@@ -1158,47 +1295,29 @@ def _make_spherical_hook(
     direction: Tensor,
     angle_degrees: float,
 ):
-    """Create a forward hook that rotates activations along a geodesic.
+    """Create a hook that rotates activations toward directional removal.
 
-    Implements Spherical Steering (arxiv:2602.08169):
-    Instead of rotating in a 2D plane, this rotates along the great circle
-    (geodesic) between the current activation direction and the target
-    steering direction on the unit hypersphere, then restores the original
-    activation magnitude.
+    Rotation follows the shortest geodesic from the activation toward its
+    projection on the hypersphere equator orthogonal to ``direction``.  The
+    requested angle is a bounded rotation budget: 0 degrees is identity and
+    90 degrees reaches full directional removal without crossing the equator
+    or inverting the activation.
 
     Parameters
     ----------
     direction : Tensor
         Unit-normalised steering direction (hidden_dim,).
     angle_degrees : float
-        Rotation angle along the geodesic.
+        Rotation budget along the geodesic, clamped to ``[0, 90]`` degrees.
     """
-    theta = math.radians(angle_degrees)
-    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    fraction = min(max(angle_degrees / 90.0, 0.0), 1.0)
 
     def hook(module, input, output):
         h = output
         if isinstance(h, tuple):
             h = h[0]
 
-        d = direction.to(h.device, dtype=h.dtype)
-
-        # Preserve original magnitude.
-        h_norm = h.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        h_hat = h / h_norm
-
-        # Geodesic angle between h_hat and d.
-        cos_alpha = (h_hat @ d).unsqueeze(-1).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
-        sin_alpha = (1.0 - cos_alpha * cos_alpha).clamp(min=1e-14).sqrt()
-
-        # Tangent vector at h_hat pointing toward d on the great circle.
-        t = (d - cos_alpha * h_hat) / sin_alpha
-
-        # Rotate h_hat by theta along the geodesic.
-        h_hat_new = cos_t * h_hat + sin_t * t
-
-        # Restore original magnitude.
-        h_new = h_norm * h_hat_new
+        h_new = _rotate_toward_removal(h, direction, fraction)
 
         if isinstance(output, tuple):
             return (h_new,) + output[1:]
@@ -1250,7 +1369,8 @@ def _apply_spherical_steering(
         else:  # LINEAR
             strength = sp.max_weight + t * (sp.min_weight - sp.max_weight)
 
-        angle = strength * 180.0
+        # Strength has the same bounded removal semantics as angular mode.
+        angle = strength * 90.0
 
         if global_vector is None:
             v = steering_vectors[layer_idx + 1]

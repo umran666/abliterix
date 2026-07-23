@@ -6,7 +6,13 @@ import argparse
 import os
 import sys
 
-from abliterix.scriptlib import extract_trial_params, load_trial, setup_io
+from abliterix.scriptlib import (
+    apply_trial_artifact,
+    compute_trial_vectors,
+    extract_trial_artifact,
+    load_trial,
+    setup_io,
+)
 
 setup_io()
 
@@ -67,15 +73,16 @@ def main():
     from abliterix.settings import AbliterixConfig
     from abliterix.types import ChatMessage
     from abliterix.util import flush_memory
-    from abliterix.vectors import compute_steering_vectors
 
     trials = [load_trial(args.checkpoint, args.model, tid) for tid in trial_ids]
+    artifacts = [extract_trial_artifact(t) for t in trials]
     for tid, t in zip(trial_ids, trials):
         kl = t.user_attrs.get("kl_divergence")
         ref = t.user_attrs.get("refusals")
         print(f"Loaded Trial #{tid}: KL={kl:.6e}, refusals={ref}")
 
     config = AbliterixConfig()
+    apply_trial_artifact(config, artifacts[0])
     engine = SteeringEngine(config)
 
     print("\nComputing steering vectors...")
@@ -83,14 +90,15 @@ def main():
     target = load_prompt_dataset(config, config.target_prompts)
     benign_states = engine.extract_hidden_states_batched(benign)
     target_states = engine.extract_hidden_states_batched(target)
-    vectors = compute_steering_vectors(
-        benign_states,
-        target_states,
-        config.steering.vector_method,
-        config.steering.orthogonal_projection,
-    )
-    del benign_states, target_states
-    flush_memory()
+    trial_vectors = []
+    trial_configs = []
+    for artifact in artifacts:
+        trial_config = config.model_copy(deep=True)
+        apply_trial_artifact(trial_config, artifact)
+        trial_configs.append(trial_config)
+        trial_vectors.append(
+            compute_trial_vectors(artifact, benign_states, target_states, trial_config)
+        )
 
     safety_experts = None
     if engine.has_expert_routing():
@@ -119,17 +127,20 @@ def main():
             )
             print(f"\nQ: {msg.user}\nA: {r[0][:500]}")
 
-    for tid, trial in zip(trial_ids, trials):
+    for tid, artifact, vectors, trial_config in zip(
+        trial_ids, artifacts, trial_vectors, trial_configs
+    ):
         engine.restore_baseline()
-        direction_index, parameters, routing = extract_trial_params(trial)
         apply_steering(
             engine,
             vectors,
-            direction_index,
-            parameters,
-            config,
+            artifact.vector_index,
+            artifact.profiles,
+            trial_config,
             safety_experts=safety_experts,
-            routing_config=routing,
+            routing_config=artifact.routing,
+            benign_states=benign_states,
+            target_states=target_states,
         )
 
         print(f"\n{SEP}\nABLITERATED (Trial #{tid}):\n{SEP}")
@@ -139,6 +150,9 @@ def main():
             )
             print(f"\nQ: {msg.user}\nA: {r[0][:500]}")
         print(f"\n{SEP}")
+
+    del benign_states, target_states
+    flush_memory()
 
 
 if __name__ == "__main__":

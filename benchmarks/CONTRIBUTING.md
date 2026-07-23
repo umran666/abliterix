@@ -77,7 +77,7 @@ on a known H100 pod and commits the result.
 
 - Generation tokens (`min=100`, `max=150`) — pinned by the spec.
 - Judge model — pinned to `google/gemini-3-flash-preview` for
-  `spec_version 1.0`.
+  `spec_version 1.1`.
 - Datasets — pinned by SHA256. The runner refuses to start on a
   hash mismatch.
 - Single user turn, no system prompt, model's own chat template.

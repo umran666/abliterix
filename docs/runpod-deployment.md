@@ -101,7 +101,7 @@ split = "train[400:420]"
 
 | Optimization | Effect | Config |
 |---|---|---|
-| Expert Parallelism (EP) | Better MoE throughput vs TP-only | `enable_expert_parallel=True` in vllm_backend.py |
+| Expert Parallelism (EP) | Better MoE throughput vs TP-only | `enable_expert_parallel = None` auto-enables only for MoE topology |
 | FP8 KV cache | 2x KV cache capacity | `kv_cache_dtype="fp8_e4m3"` |
 | CUTLASS grouped GEMM for MoE | +57% expert throughput on H100 | `VLLM_MOE_USE_DEEP_GEMM=0` |
 | Projection cache OOM fix | No more dequant cache accumulation | `del W` after each projection |

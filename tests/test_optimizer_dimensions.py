@@ -6,8 +6,11 @@ TPE loop with a real model is not exercised here — it's integration-
 tested on the GPU pod separately. See docs/benchmarks/.
 """
 
+import pytest
 import torch
 
+from abliterix.core.optimizer_support import vector_scope_choices
+from abliterix.settings import AbliterixConfig
 from abliterix.types import DirectTransform
 
 
@@ -130,3 +133,44 @@ def test_variants_dict_keys_are_categorical_friendly():
     for k in keys:
         assert isinstance(k, str)
         assert k.replace("_", "").isalnum()
+
+
+def test_multi_direction_search_forces_per_layer_scope():
+    """A global layer interpolation cannot silently ignore rank-k vectors."""
+    config = AbliterixConfig(model={"model_id": "dummy/model"})
+    single = torch.zeros(4, 8)
+    pair = torch.zeros(2, 4, 8)
+
+    assert vector_scope_choices(config, [single, pair]) == ["per layer"]
+
+
+def test_single_direction_search_keeps_global_and_per_layer_choices():
+    config = AbliterixConfig(model={"model_id": "dummy/model"})
+
+    assert vector_scope_choices(config, [torch.zeros(4, 8)]) == [
+        "global",
+        "per layer",
+    ]
+
+
+@pytest.mark.parametrize(
+    "mode", ["angular", "adaptive_angular", "spherical", "vector_field"]
+)
+def test_runtime_hook_modes_reject_rank_k_recipes(mode):
+    with pytest.raises(ValueError, match="runtime hook"):
+        AbliterixConfig(
+            model={"model_id": "test/model"},
+            steering={"steering_mode": mode, "n_directions": 2},
+        )
+
+
+def test_multi_direction_direct_rejects_transform_that_would_be_ignored():
+    with pytest.raises(ValueError, match="direct_transform"):
+        AbliterixConfig(
+            model={"model_id": "test/model"},
+            steering={
+                "steering_mode": "direct",
+                "n_directions": 2,
+                "direct_transform": "orba",
+            },
+        )

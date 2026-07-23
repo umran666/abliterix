@@ -34,7 +34,13 @@ import gc
 import os
 import sys
 
-from abliterix.scriptlib import extract_trial_params, load_trial, setup_io
+from abliterix.scriptlib import (
+    apply_trial_artifact,
+    compute_trial_vectors,
+    extract_trial_artifact,
+    load_trial,
+    setup_io,
+)
 
 setup_io()
 
@@ -96,12 +102,14 @@ from huggingface_hub import ModelCard, ModelCardData  # noqa: E402
 from abliterix.settings import AbliterixConfig  # noqa: E402
 from abliterix.core.engine import SteeringEngine  # noqa: E402
 from abliterix.core.steering import apply_steering  # noqa: E402
-from abliterix.vectors import compute_steering_vectors  # noqa: E402
 from abliterix.data import load_prompt_dataset  # noqa: E402
 
 # ── Load trial ────────────────────────────────────────────────────────────
 trial = load_trial(args.checkpoint_dir, args.model, args.trial)
-direction_index, parameters, moe_params = extract_trial_params(trial)
+artifact = extract_trial_artifact(trial)
+direction_index = artifact.vector_index
+parameters = artifact.profiles
+moe_params = artifact.routing
 trial_kl = trial.user_attrs.get("kl_divergence", 0)
 trial_refusals = trial.user_attrs.get("refusals", 0)
 
@@ -114,6 +122,7 @@ if moe_params:
 
 # ── Load model ────────────────────────────────────────────────────────────
 config = AbliterixConfig()
+apply_trial_artifact(config, artifact)
 config.inference.batch_size = args.batch_size
 print(f"\nLoading {args.model}...")
 engine = SteeringEngine(config)
@@ -127,11 +136,8 @@ print(f"  {len(good_prompts)} benign, {len(bad_prompts)} target prompts")
 with torch.no_grad():
     good_residuals = engine.extract_hidden_states_batched(good_prompts)
     bad_residuals = engine.extract_hidden_states_batched(bad_prompts)
-    refusal_directions = compute_steering_vectors(
-        good_residuals,
-        bad_residuals,
-        config.steering.vector_method,
-        config.steering.orthogonal_projection,
+    refusal_directions = compute_trial_vectors(
+        artifact, good_residuals, bad_residuals, config
     )
     if config.steering.orthogonal_projection:
         print("  Applied orthogonalization")
@@ -142,7 +148,7 @@ if moe_params and engine.has_expert_routing():
     print("Profiling MoE expert activations...")
     safety_experts = engine.identify_safety_experts(good_prompts, bad_prompts)
 
-del good_residuals, bad_residuals, good_prompts, bad_prompts
+del good_prompts, bad_prompts
 gc.collect()
 torch.cuda.empty_cache()
 
@@ -157,7 +163,12 @@ apply_steering(
     config,
     safety_experts=safety_experts,
     routing_config=moe_params,
+    benign_states=good_residuals,
+    target_states=bad_residuals,
 )
+del good_residuals, bad_residuals
+gc.collect()
+torch.cuda.empty_cache()
 
 # ── Merge & Upload ────────────────────────────────────────────────────────
 print("Merging LoRA weights into base model...")

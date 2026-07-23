@@ -5,8 +5,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import json
+import inspect
 import os
-import sys
 from collections import defaultdict
 from contextlib import suppress
 from typing import Any, Type, cast
@@ -35,7 +35,7 @@ from transformers.generation import (
 )
 
 from ..settings import AbliterixConfig
-from ..types import ChatMessage, QuantMode, SteeringMode, WeightNorm
+from ..types import ChatMessage, QuantMode, SteeringMode, VectorMethod, WeightNorm
 from ..util import chunk_batches, flush_memory, print
 from . import fp8_utils
 
@@ -43,6 +43,70 @@ from . import fp8_utils
 import transformers as _tf
 
 _dtype_kwarg = "dtype" if int(_tf.__version__.split(".")[0]) >= 5 else "torch_dtype"
+
+
+# Models registered here have a known remote-config mismatch where MTP heads
+# are appended to ``layer_types`` even though ``num_hidden_layers`` describes
+# decoder layers only.  The registry is populated from the model's own
+# config.json before its remote configuration class is instantiated.
+_MTP_LAYER_TYPE_ADAPTERS: dict[str, tuple[int, int]] = {}
+
+
+def _model_config_name(config: PretrainedConfig) -> str:
+    """Return the loader identity attached to a Transformers config."""
+    return str(
+        getattr(config, "_name_or_path", "") or getattr(config, "name_or_path", "")
+    ).rstrip("/")
+
+
+def _adapt_registered_mtp_layer_types(config: PretrainedConfig) -> bool:
+    """Apply a registered MTP layer mapping to one in-memory config.
+
+    The exact model identity and both observed lengths must match the
+    preflighted config.json.  This prevents the compatibility adapter from
+    hiding unrelated or newly changed model configuration errors.
+    """
+    spec = _MTP_LAYER_TYPE_ADAPTERS.get(_model_config_name(config))
+    if spec is None:
+        return False
+
+    expected_total, expected_hidden = spec
+    layer_types = getattr(config, "layer_types", None)
+    n_hidden = getattr(config, "num_hidden_layers", None)
+    if (
+        not isinstance(layer_types, list)
+        or len(layer_types) != expected_total
+        or n_hidden != expected_hidden
+    ):
+        return False
+
+    config.layer_types = layer_types[:expected_hidden]
+    return True
+
+
+def _install_mtp_layer_type_validator() -> None:
+    """Install the process-local adapter ahead of Transformers validation."""
+    validators = list(PretrainedConfig.__class_validators__)  # ty:ignore[unresolved-attribute]
+    if any(
+        getattr(validator, "_abliterix_mtp_adapter", False) for validator in validators
+    ):
+        return
+
+    for index, validator in enumerate(validators):
+        if getattr(validator, "__name__", "") != "validate_layer_type":
+            continue
+
+        def validate_layer_type(config, _original=validator):
+            _adapt_registered_mtp_layer_types(config)
+            _original(config)
+
+        validate_layer_type._abliterix_mtp_adapter = True  # type: ignore[attr-defined]
+        validators[index] = validate_layer_type
+        PretrainedConfig.__class_validators__ = validators  # ty:ignore[unresolved-attribute]
+        return
+
+
+_install_mtp_layer_type_validator()
 
 
 def resolve_model_class(
@@ -61,16 +125,20 @@ def resolve_model_class(
     return AutoModelForCausalLM
 
 
-def _patch_mtp_layer_types(model_id: str, trust_remote_code: bool | None) -> None:
-    """Patch models whose ``layer_types`` includes MTP head layers.
+def _register_mtp_layer_types_adapter(
+    model_id: str,
+    trust_remote_code: bool | None,
+) -> None:
+    """Register models whose ``layer_types`` includes MTP head layers.
 
     Models like Step-3.5-Flash define ``layer_types`` with 48 entries (45
     decoder + 3 MTP) but ``num_hidden_layers=45``.  Transformers >= 5.5
     validates that ``len(layer_types) == num_hidden_layers``, causing a
     ``ValueError``.
 
-    We patch the cached remote config module source file to truncate
-    ``layer_types`` before the parent ``__init__`` validator runs.
+    The compatibility adjustment is performed on the in-memory config just
+    before the parent validator runs.  No files in the Hugging Face cache are
+    modified.
     """
     try:
         cfgs = PretrainedConfig.get_config_dict(
@@ -83,42 +151,14 @@ def _patch_mtp_layer_types(model_id: str, trust_remote_code: bool | None) -> Non
         if not (layer_types and n_hidden and len(layer_types) > n_hidden):
             return
 
-        # Find the cached configuration_*.py file for this model and patch it
-        # to truncate layer_types before super().__init__().
-        from pathlib import Path
-
-        cache_dir = (
-            Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-            / "modules"
-            / "transformers_modules"
+        _MTP_LAYER_TYPE_ADAPTERS[model_id.rstrip("/")] = (
+            len(layer_types),
+            n_hidden,
         )
-
-        # Search for configuration files matching this model.
-        for config_py in cache_dir.rglob("configuration_*.py"):
-            if model_id.split("/")[-1].lower().replace("-", "_").replace(
-                ".", "_"
-            ) not in str(config_py).lower().replace("-", "_").replace(".", "_"):
-                continue
-            text = config_py.read_text()
-            marker = "self.layer_types = layer_types"
-            patch = (
-                "# Truncate MTP head layers (transformers >= 5.5 validation fix)\n"
-                "        if layer_types is not None and len(layer_types) > num_hidden_layers:\n"
-                "            layer_types = layer_types[:num_hidden_layers]\n"
-                "        self.layer_types = layer_types"
-            )
-            if marker in text and "Truncate MTP" not in text:
-                text = text.replace(marker, patch)
-                config_py.write_text(text)
-                # Invalidate any cached import of this module.
-                for mod_name in list(sys.modules):
-                    if "configuration_step3p5" in mod_name:
-                        del sys.modules[mod_name]
-                print(
-                    f"  [dim]Patched {config_py.name}: "
-                    f"truncating {len(layer_types)} layer_types → {n_hidden}[/]"
-                )
-                return
+        print(
+            "  [dim]Enabled process-local MTP config adapter: "
+            f"truncating {len(layer_types)} layer_types → {n_hidden}[/]"
+        )
     except Exception:
         pass
 
@@ -181,6 +221,119 @@ class _LogitsSampler(LogitsProcessor):
         return scores
 
 
+class _ForcedContinuationProcessor(LogitsProcessor):
+    """Force a known continuation while preserving earlier captured logits."""
+
+    def __init__(self, token_ids: list[list[int]]):
+        self.token_ids = token_ids
+        self.step = 0
+
+    def __call__(self, input_ids: LongTensor, scores: FloatTensor) -> FloatTensor:
+        if self.step >= len(self.token_ids[0]):
+            raise RuntimeError("Forced continuation received too many decode steps")
+        if scores.shape[0] != len(self.token_ids):
+            raise RuntimeError(
+                "Forced continuation batch changed during generation: "
+                f"expected {len(self.token_ids)}, got {scores.shape[0]}"
+            )
+
+        next_ids = torch.tensor(
+            [row[self.step] for row in self.token_ids],
+            dtype=torch.long,
+            device=scores.device,
+        ).unsqueeze(1)
+        forced = torch.full_like(scores, float("-inf"))
+        forced.scatter_(1, next_ids, 0.0)
+        self.step += 1
+        return forced
+
+
+def _captured_logprobs(sampler: _LogitsSampler, expected_steps: int) -> Tensor:
+    """Return normalized captured scores without collapsing the token axis.
+
+    A single-token measurement retains the historical ``(batch, vocab)``
+    shape.  Multi-token measurements use ``(batch, step, vocab)`` so the
+    scorer can average per-step KL divergences instead of treating an
+    arithmetic mean of log-probabilities as a distribution.
+    """
+    if len(sampler.scores) != expected_steps:
+        raise RuntimeError(
+            "Generation ended before all KL score steps were captured: "
+            f"expected {expected_steps}, got {len(sampler.scores)}"
+        )
+
+    stacked = torch.stack(
+        # A full-vocabulary log-softmax in BF16 loses enough tail precision to
+        # materially distort small KL values (and made the one-token HF result
+        # disagree with vLLM while later FP32 steps agreed).  Keep model logits
+        # in their native dtype, but normalise the captured metric in FP32.
+        [F.log_softmax(scores.float(), dim=-1) for scores in sampler.scores],
+        dim=1,
+    )
+    if expected_steps == 1:
+        return stacked[:, 0, :]
+    return stacked
+
+
+def _forward_supports_logits_to_keep(model: Module) -> bool:
+    """Return whether the underlying model explicitly limits output logits.
+
+    PEFT and ``torch.compile`` expose generic ``**kwargs`` forward signatures,
+    so inspect their wrapped base model instead.  A generic ``**kwargs`` alone
+    is deliberately not treated as support: older and remote-code models may
+    reject or mishandle an unknown keyword deeper in their forward path.
+    """
+    current: Any = model
+    seen: set[int] = set()
+
+    while id(current) not in seen:
+        seen.add(id(current))
+
+        original = getattr(current, "_orig_mod", None)
+        if original is not None and original is not current:
+            current = original
+            continue
+
+        get_base_model = getattr(current, "get_base_model", None)
+        if callable(get_base_model):
+            try:
+                base = get_base_model()
+            except Exception:
+                base = None
+            if base is not None and base is not current:
+                current = base
+                continue
+        break
+
+    try:
+        return "logits_to_keep" in inspect.signature(current.forward).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _required_lora_rank(config: AbliterixConfig) -> int:
+    """Return the adapter rank required by every configured vector recipe."""
+    steering = config.steering
+    if steering.steering_mode != SteeringMode.LORA:
+        return 1
+
+    required = max(1, steering.n_directions)
+    if steering.ablate_harmfulness_direction or steering.search_harmfulness_direction:
+        required = max(required, 2)
+    if steering.vector_method == VectorMethod.SOM:
+        required = max(required, steering.som_grid_h * steering.som_grid_w)
+    if steering.vector_method == VectorMethod.SAE:
+        required = max(required, steering.sae_top_k)
+    if config.iterative.enabled:
+        iterative_rank = (
+            config.iterative.max_iterations * config.iterative.per_iteration_directions
+        )
+        required = max(required, iterative_rank)
+    if steering.weight_normalization == WeightNorm.FULL:
+        required = max(required, steering.full_norm_lora_rank)
+    return required
+
+
 class SteeringEngine:
     """Manages model loading, tokenisation, generation, and LoRA adapters.
 
@@ -210,9 +363,12 @@ class SteeringEngine:
         print()
         print(f"Loading model [bold]{model_id}[/]...")
 
-        # Patch MTP models whose layer_types length exceeds num_hidden_layers
+        # Adapt MTP models whose layer_types length exceeds num_hidden_layers
         # (e.g. Step-3.5-Flash: 48 layer_types vs 45 num_hidden_layers).
-        _patch_mtp_layer_types(model_id, config.model.trust_remote_code)
+        _register_mtp_layer_types_adapter(
+            model_id,
+            config.model.trust_remote_code,
+        )
 
         self.tokenizer = load_tokenizer(
             model_id,
@@ -455,7 +611,7 @@ class SteeringEngine:
         if config.model.backend in ("vllm", "sglang"):
             print("* TP backend: skipping HF LoRA adapter initialisation")
             self._lora_b_weights = []
-            self.peft_config = None  # ty:ignore[assignment]
+            self.peft_config = None  # ty:ignore[invalid-assignment]
         else:
             self._init_adapters()
         self._init_expert_routing()
@@ -722,10 +878,7 @@ class SteeringEngine:
 
         targets = sorted(target_paths)
 
-        if self.config.steering.weight_normalization != WeightNorm.FULL:
-            rank = 1
-        else:
-            rank = self.config.steering.full_norm_lora_rank
+        rank = _required_lora_rank(self.config)
 
         self.peft_config = LoraConfig(
             r=rank,
@@ -1279,13 +1432,40 @@ class SteeringEngine:
         For quantised models the base model is reloaded in full precision on
         CPU before merging, as in-place dequantisation is not supported.
         """
-        assert isinstance(self.model, PeftModel)
+        mode = self.config.steering.steering_mode
+        runtime_only = {
+            SteeringMode.ANGULAR,
+            SteeringMode.ADAPTIVE_ANGULAR,
+            SteeringMode.SPHERICAL,
+            SteeringMode.VECTOR_FIELD,
+        }
+        if mode in runtime_only:
+            raise RuntimeError(
+                f"Steering mode {mode.value!r} is runtime-only and cannot be "
+                "represented by a merged checkpoint. Export a runtime artifact "
+                "or choose 'lora'/'direct' instead."
+            )
 
-        if self.config.model.quant_method in (
+        quantized = self.config.model.quant_method in (
             QuantMode.BNB_4BIT,
             QuantMode.BNB_8BIT,
             QuantMode.FP8,
-        ):
+        )
+        has_non_lora_edits = bool(
+            getattr(self, "_router_originals", None)
+            or getattr(self, "_expert_deltas", None)
+        )
+        if quantized and (mode == SteeringMode.DIRECT or has_non_lora_edits):
+            raise RuntimeError(
+                "Cannot faithfully export active direct/router/expert edits "
+                "from a quantized model: full-precision reload would discard "
+                "those base-weight changes. Replay the resolved steering plan "
+                "on an unquantized HF model before exporting."
+            )
+
+        assert isinstance(self.model, PeftModel)
+
+        if quantized:
             adapter_state = {
                 n: p.data.clone().cpu()
                 for n, p in self.model.named_parameters()
@@ -1314,6 +1494,32 @@ class SteeringEngine:
             self.needs_reload = True
             return merged
 
+    def export_adapter(self, save_directory: str | os.PathLike[str]) -> None:
+        """Save the active LoRA adapter without BF16 merge-rounding drift.
+
+        Loading this adapter on the same base model/revision preserves the
+        runtime LoRA computation.  Base-weight edits (such as MoE router or
+        expert edits) are deliberately rejected because PEFT adapter files
+        cannot represent them.
+        """
+        mode = self.config.steering.steering_mode
+        if mode != SteeringMode.LORA:
+            raise RuntimeError(
+                "Adapter export only represents LoRA steering; use merged "
+                "export for an unquantized direct-edit model."
+            )
+        if getattr(self, "_router_originals", None) or getattr(
+            self, "_expert_deltas", None
+        ):
+            raise RuntimeError(
+                "Adapter export cannot represent active router/expert base-weight "
+                "edits. Export a merged unquantized model instead."
+            )
+        if not isinstance(self.model, PeftModel):
+            raise RuntimeError("No active PEFT LoRA adapter is available to export.")
+
+        self.model.save_pretrained(save_directory)
+
     # ------------------------------------------------------------------
     # Internal position-cache management
     # ------------------------------------------------------------------
@@ -1336,8 +1542,8 @@ class SteeringEngine:
     # Tokenisation helpers
     # ------------------------------------------------------------------
 
-    def _tokenize(self, messages: list[ChatMessage]) -> BatchEncoding:
-        """Apply the chat template, optionally prepend the response prefix, and tokenise."""
+    def _render_messages(self, messages: list[ChatMessage]) -> list[str]:
+        """Render messages exactly as the model-facing tokenizer sees them."""
         chats = []
         for msg in messages:
             chat: list[dict] = []
@@ -1358,6 +1564,44 @@ class SteeringEngine:
 
         if self.response_prefix:
             texts = [t + self.response_prefix for t in texts]
+
+        return texts
+
+    def _length_sorted_indices(self, messages: list[ChatMessage]) -> list[int]:
+        """Return a stable ordering by rendered, unpadded token length."""
+        if not messages:
+            return []
+
+        encoded = self.tokenizer(
+            self._render_messages(messages),
+            padding=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        input_ids = encoded["input_ids"]
+        lengths = [len(row) for row in input_ids]
+        if len(lengths) != len(messages):
+            raise RuntimeError(
+                "Tokenizer returned a different number of rows while sorting "
+                f"messages: expected {len(messages)}, got {len(lengths)}"
+            )
+        return sorted(range(len(messages)), key=lambda index: lengths[index])
+
+    @staticmethod
+    def _restore_tensor_rows(values: Tensor, original_indices: list[int]) -> Tensor:
+        """Restore rows whose current positions follow ``original_indices``."""
+        inverse = torch.empty(
+            len(original_indices),
+            dtype=torch.long,
+            device=values.device,
+        )
+        for sorted_index, original_index in enumerate(original_indices):
+            inverse[original_index] = sorted_index
+        return values.index_select(0, inverse)
+
+    def _tokenize(self, messages: list[ChatMessage]) -> BatchEncoding:
+        """Apply the chat template, optionally prepend the response prefix, and tokenise."""
+        texts = self._render_messages(messages)
 
         return self.tokenizer(
             texts,
@@ -1424,10 +1668,22 @@ class SteeringEngine:
         skip_special_tokens: bool = False,
         max_new_tokens: int | None = None,
         min_new_tokens: int | None = None,
+        *,
+        sort_by_length: bool = False,
     ) -> list[str]:
-        """Batched wrapper around :meth:`generate_text`."""
+        """Batched generation, optionally grouped by near-equal token length."""
+        original_indices = (
+            self._length_sorted_indices(messages)
+            if sort_by_length
+            else list(range(len(messages)))
+        )
+        ordered_messages = [messages[index] for index in original_indices]
+
         out: list[str] = []
-        for batch in chunk_batches(messages, self.config.inference.batch_size):
+        for batch in chunk_batches(
+            ordered_messages,
+            self.config.inference.batch_size,
+        ):
             out.extend(
                 self.generate_text(
                     batch,
@@ -1436,7 +1692,13 @@ class SteeringEngine:
                     min_new_tokens=min_new_tokens,
                 )
             )
-        return out
+        if not sort_by_length:
+            return out
+
+        restored = ["" for _ in out]
+        for sorted_index, original_index in enumerate(original_indices):
+            restored[original_index] = out[sorted_index]
+        return restored
 
     def generate_and_score(
         self,
@@ -1451,31 +1713,33 @@ class SteeringEngine:
         Avoids the duplicate-prefill overhead of calling generate_text() and
         compute_logprobs() separately on the same prompt batch.
         """
+        if kl_token_count < 1:
+            raise ValueError("kl_token_count must be at least 1")
+        if kl_token_count > max_new_tokens:
+            raise ValueError(
+                f"kl_token_count ({kl_token_count}) cannot exceed "
+                f"max_new_tokens ({max_new_tokens})"
+            )
+
         sampler = _LogitsSampler(kl_token_count)
 
         gen_kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens,
             "logits_processor": [sampler],
         }
-        if min_new_tokens is not None:
-            if min_new_tokens > max_new_tokens:
+        resolved_min = min_new_tokens
+        if kl_token_count > 1:
+            resolved_min = max(resolved_min or 0, kl_token_count)
+        if resolved_min is not None:
+            if resolved_min > max_new_tokens:
                 raise ValueError(
-                    f"min_gen_tokens ({min_new_tokens}) cannot exceed "
+                    f"min_gen_tokens ({resolved_min}) cannot exceed "
                     f"max_gen_tokens ({max_new_tokens})"
                 )
-            gen_kwargs["min_new_tokens"] = min_new_tokens
+            gen_kwargs["min_new_tokens"] = resolved_min
 
         inputs, outputs = self._generate(messages, **gen_kwargs)
-
-        actual_n = min(kl_token_count, len(sampler.scores))
-        if actual_n == 1:
-            logprobs = F.log_softmax(sampler.scores[0], dim=-1)
-        else:
-            stacked = torch.stack(
-                [F.log_softmax(s, dim=-1) for s in sampler.scores[:actual_n]],
-                dim=1,
-            )
-            logprobs = stacked.mean(dim=1)
+        logprobs = _captured_logprobs(sampler, kl_token_count)
 
         input_len = cast(Tensor, inputs["input_ids"]).shape[1]
         responses = self.tokenizer.batch_decode(
@@ -1532,7 +1796,26 @@ class SteeringEngine:
         inputs = self._tokenize(messages)
         self._reset_position_cache()
 
-        outputs = self.model(**inputs, output_hidden_states=True)
+        # Most recent Transformers causal-LM heads can avoid materialising
+        # logits for every prompt token.  This matters especially for Qwen3.5
+        # (248k vocabulary): hidden-state extraction only consumes residuals,
+        # so retaining one final-token logit slice is sufficient.  Inspect the
+        # explicit base-model signature first to keep older/custom models
+        # compatible instead of optimistically passing an unknown keyword.
+        cache = getattr(self, "_logits_to_keep_support", None)
+        model_identity = id(self.model)
+        if cache is None or cache[0] != model_identity:
+            cache = (
+                model_identity,
+                _forward_supports_logits_to_keep(cast(Module, self.model)),
+            )
+            self._logits_to_keep_support = cache
+
+        forward_kwargs: dict[str, Any] = {"output_hidden_states": True}
+        if cache[1]:
+            forward_kwargs["logits_to_keep"] = 1
+
+        outputs = self.model(**inputs, **forward_kwargs)
         hidden_states = outputs.hidden_states
 
         residuals = torch.stack(
@@ -1552,10 +1835,33 @@ class SteeringEngine:
 
         return residuals
 
-    def extract_hidden_states_batched(self, messages: list[ChatMessage]) -> Tensor:
-        offload = self.config.inference.offload_outputs_to_cpu
+    def extract_hidden_states_batched(
+        self,
+        messages: list[ChatMessage],
+        *,
+        sort_by_length: bool = False,
+    ) -> Tensor:
+        """Extract residuals, optionally using near-length prompt batches."""
+        if not messages:
+            raise ValueError("messages must not be empty")
+
+        original_indices = (
+            self._length_sorted_indices(messages)
+            if sort_by_length
+            else list(range(len(messages)))
+        )
+        ordered_messages = [messages[index] for index in original_indices]
+
+        offload = getattr(
+            self.config.inference,
+            "offload_outputs_to_cpu",
+            False,
+        )
         parts = []
-        for batch in chunk_batches(messages, self.config.inference.batch_size):
+        for batch in chunk_batches(
+            ordered_messages,
+            self.config.inference.batch_size,
+        ):
             part = self.extract_hidden_states(batch)
             if offload:
                 # Move each batch's residuals to host RAM immediately so the
@@ -1566,7 +1872,10 @@ class SteeringEngine:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             parts.append(part)
-        return torch.cat(parts, dim=0)
+        residuals = torch.cat(parts, dim=0)
+        if not sort_by_length:
+            return residuals
+        return self._restore_tensor_rows(residuals, original_indices)
 
     # ------------------------------------------------------------------
     # Log-probability measurement
@@ -1580,23 +1889,34 @@ class SteeringEngine:
         return F.log_softmax(outputs.logits[:, -1, :], dim=-1)
 
     def compute_logprobs(self, messages: list[ChatMessage]) -> Tensor:
-        """Compute averaged next-token log-probabilities over kl_token_count steps."""
+        """Compute next-token log-probabilities over ``token_count`` steps.
+
+        The legacy single-token result has shape ``(batch, vocab)``.  For
+        multiple tokens, the result has shape ``(batch, step, vocab)`` so
+        callers can compute a normalized divergence for each generated step.
+        """
         n = self.config.kl.token_count
 
+        if n < 1:
+            raise ValueError("kl.token_count must be at least 1")
         if n == 1:
             return self._logprobs_forward_pass(messages)
 
         sampler = _LogitsSampler(n)
-        self._generate(messages, max_new_tokens=n, logits_processor=[sampler])
-
-        stacked = torch.stack(
-            [F.log_softmax(s, dim=-1) for s in sampler.scores],
-            dim=1,
+        self._generate(
+            messages,
+            max_new_tokens=n,
+            min_new_tokens=n,
+            logits_processor=[sampler],
         )
-        return stacked.mean(dim=1)
+        return _captured_logprobs(sampler, n)
 
     def compute_logprobs_batched(self, messages: list[ChatMessage]) -> Tensor:
-        offload = self.config.inference.offload_outputs_to_cpu
+        offload = getattr(
+            self.config.inference,
+            "offload_outputs_to_cpu",
+            False,
+        )
         parts = []
         for batch in chunk_batches(messages, self.config.inference.batch_size):
             part = self.compute_logprobs(batch)
@@ -1610,6 +1930,89 @@ class SteeringEngine:
                     torch.cuda.empty_cache()
             parts.append(part)
         return torch.cat(parts, dim=0)
+
+    def score_continuation_logprobs_batched(
+        self,
+        messages: list[ChatMessage],
+        continuations: list[str],
+        token_count: int,
+        *,
+        sort_by_length: bool = False,
+    ) -> Tensor:
+        """Score fixed continuations on identical teacher-forced prefixes.
+
+        For continuation token ``t`` this returns the full-vocabulary
+        distribution conditioned on the prompt and continuation tokens before
+        ``t``.  Reusing the same continuations for baseline and steered models
+        therefore measures both models on the same contexts instead of on
+        their independently generated trajectories.
+
+        A one-token result has shape ``(batch, vocab)``; multiple tokens have
+        shape ``(batch, step, vocab)``.  Results are always normalised in
+        ``float32``.
+        """
+        if token_count < 1:
+            raise ValueError("token_count must be at least 1")
+        if len(messages) != len(continuations):
+            raise ValueError(
+                "messages and continuations must have the same length: "
+                f"got {len(messages)} and {len(continuations)}"
+            )
+        if not messages:
+            raise ValueError("messages and continuations must not be empty")
+
+        original_indices = (
+            self._length_sorted_indices(messages)
+            if sort_by_length
+            else list(range(len(messages)))
+        )
+        ordered_messages = [messages[index] for index in original_indices]
+        ordered_continuations = [continuations[index] for index in original_indices]
+
+        all_logprobs: list[Tensor] = []
+        batch_size = self.config.inference.batch_size
+        for start in range(0, len(ordered_messages), batch_size):
+            message_batch = ordered_messages[start : start + batch_size]
+            continuation_batch = ordered_continuations[start : start + batch_size]
+
+            encoded_continuations = self.tokenizer(
+                continuation_batch,
+                add_special_tokens=False,
+                padding=False,
+                truncation=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            continuation_ids = encoded_continuations["input_ids"]
+            if isinstance(continuation_ids, Tensor):
+                continuation_rows = continuation_ids.tolist()
+            else:
+                continuation_rows = [list(row) for row in continuation_ids]
+
+            for row_index, continuation in enumerate(continuation_rows):
+                if len(continuation) < token_count:
+                    original_index = original_indices[start + row_index]
+                    raise ValueError(
+                        "Continuation is shorter than token_count after "
+                        f"tokenization at batch index {original_index}: "
+                        f"expected at least {token_count}, got {len(continuation)}"
+                    )
+
+            forced_rows = [row[:token_count] for row in continuation_rows]
+            sampler = _LogitsSampler(token_count)
+            forcing = _ForcedContinuationProcessor(forced_rows)
+            self._generate(
+                message_batch,
+                max_new_tokens=token_count,
+                min_new_tokens=token_count,
+                logits_processor=[sampler, forcing],
+            )
+            all_logprobs.append(_captured_logprobs(sampler, token_count))
+
+        logprobs = torch.cat(all_logprobs, dim=0)
+        if not sort_by_length:
+            return logprobs
+        return self._restore_tensor_rows(logprobs, original_indices)
 
     # ------------------------------------------------------------------
     # Interactive chat

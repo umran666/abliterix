@@ -30,7 +30,11 @@ from ..types import (
     SteeringProfile,
     WeightNorm,
 )
-from ..weight_transforms import apply_direct_transform
+from ..weight_transforms import (
+    apply_direct_transform,
+    apply_ega_projection,
+    resolve_ega_axis,
+)
 
 try:
     import bitsandbytes as bnb
@@ -44,6 +48,30 @@ except ImportError:  # pragma: no cover - exercised on macOS arm64 dev envs.
 _FP8_DTYPES = frozenset()
 with __import__("contextlib").suppress(AttributeError):
     _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
+
+
+def resolve_global_vector(
+    steering_vectors: Tensor, vector_index: float | None
+) -> Tensor | None:
+    """Interpolate the global steering vector from ``vector_index``.
+
+    Returns ``None`` when per-layer vectors should be used (``vector_index is
+    None``) or the tensor is a multi-direction subspace (3-D, where the first
+    axis is directions, not layers). Shared by :func:`apply_steering` and the
+    offline plan recorder (:func:`abliterix.core.fp4_repack.record_steering_plan_from_trial`)
+    so both resolve the direction identically.
+    """
+    if vector_index is None or steering_vectors.ndim == 3:
+        return None
+    fractional, integral = math.modf(vector_index + 1)
+    return F.normalize(
+        steering_vectors[int(integral)].lerp(
+            steering_vectors[int(integral) + 1],
+            fractional,
+        ),
+        p=2,
+        dim=0,
+    )
 
 
 def _dequantize_fp8_blockwise(
@@ -293,20 +321,7 @@ def apply_steering(
         )
 
     # --- Resolve the global steering vector (if applicable) ---------------
-    # For multi-direction subspace vectors (3D), global vector interpolation
-    # is not applicable — the first dim is directions, not layers.
-    if vector_index is None or steering_vectors.ndim == 3:
-        global_vector = None
-    else:
-        fractional, integral = math.modf(vector_index + 1)
-        global_vector = F.normalize(
-            steering_vectors[int(integral)].lerp(
-                steering_vectors[int(integral) + 1],
-                fractional,
-            ),
-            p=2,
-            dim=0,
-        )
+    global_vector = resolve_global_vector(steering_vectors, vector_index)
 
     # --- Direct weight editing (orthogonal projection, no LoRA) -----------
     if steering_mode == SteeringMode.DIRECT:
@@ -757,6 +772,26 @@ def _apply_direct_steering(
 
                 weight = base_mod.weight
 
+                # Defense in depth: direct editing needs a writable BF16/full-
+                # precision base weight. A bitsandbytes-quantised weight
+                # (Params4bit `quant_state`, or int8 `CB`) is packed storage
+                # that `.to(float32)` reinterprets rather than dequantises, so
+                # an in-place write would corrupt it. The config validator
+                # already rejects bnb + direct, but this guards direct
+                # programmatic callers too. (FP8 is materialised to BF16 before
+                # steering, so it is writable here.)
+                if (
+                    getattr(weight, "quant_state", None) is not None
+                    or getattr(weight, "CB", None) is not None
+                ):
+                    raise RuntimeError(
+                        f"direct steering cannot edit quantised base weight "
+                        f"'{component}' (bitsandbytes packed storage is not "
+                        "writable in place). Use steering_mode='lora', load "
+                        "unquantized, or bake a native-FP4 model offline with "
+                        "`abliterix-abliterate-fp4`."
+                    )
+
                 # Cache the original weight for later restoration.
                 # Key by the weight tensor itself for O(1) restore.
                 if weight not in engine._direct_weight_originals:
@@ -946,43 +981,25 @@ def _apply_ega_steering(
         # the engine's `_fused_down_proj_transposed` flag set at load time.
         transposed = getattr(engine, "_fused_down_proj_transposed", False)
 
+        # Axis + projection are shared with the offline FP4 repack tool via
+        # weight_transforms so the abliteration fingerprint is bit-identical.
+        axis_is_in = resolve_ega_axis(
+            tuple(fused.shape), vf.shape[0], transposed=transposed
+        )
+        if axis_is_in is None:
+            continue
+
         # Vectorised over the expert dimension: single GPU kernel batch
         # instead of a 128-iter Python loop with per-expert dtype conversions.
-        d0, d1 = fused.shape[1], fused.shape[2]
-
-        if transposed:
-            # W[e] shape (in_intermediate, out_hidden); vf lives in out_hidden (d1).
-            if vf.shape[0] != d1:
-                continue
-            axis_is_in = True  # compute W[e] @ vf → (E, d0)
-        else:
-            if vf.shape[0] == d0:
-                axis_is_in = False  # vf lives in out_hidden (d0)
-            elif vf.shape[0] == d1:
-                axis_is_in = True  # vf lives in in_intermediate (d1)
-            else:
-                continue
-
-        W_all = fused.data.to(torch.float32)  # (E, d0, d1)
-
-        if axis_is_in:
-            # proj[e] = W[e] @ vf → (E, d0)
-            proj = torch.matmul(W_all, vf)
-            W_new = W_all - strength * (proj.unsqueeze(-1) * vf.view(1, 1, -1))
-        else:
-            # proj[e] = vf @ W[e] → (E, d1)
-            proj = torch.einsum("o,eoi->ei", vf, W_all)
-            W_new = W_all - strength * (vf.view(1, -1, 1) * proj.unsqueeze(1))
-
-        if norm_preserve:
-            orig_norms = torch.linalg.vector_norm(W_all, dim=2, keepdim=True)
-            new_norms = torch.linalg.vector_norm(W_new, dim=2, keepdim=True).clamp(
-                min=1e-8
-            )
-            W_new = W_new * (orig_norms / new_norms)
-
+        W_new = apply_ega_projection(
+            fused.data,
+            vf,
+            strength=strength,
+            axis_is_in=axis_is_in,
+            preserve_row_norm=norm_preserve,
+        )
         fused.data.copy_(W_new.to(fused.dtype))
-        del W_all, W_new, proj
+        del W_new
 
 
 # ---------------------------------------------------------------------------

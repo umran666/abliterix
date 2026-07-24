@@ -128,6 +128,27 @@ def test_invalid_quant_mode_rejected():
         ModelConfig(model_id="test/model", quant_method="invalid_mode")
 
 
+def test_bnb_quant_with_direct_steering_rejected():
+    """bnb 4bit/8bit + direct-mode base editing is unsupported and must raise."""
+    import pytest
+
+    for qm in ("bnb_4bit", "bnb_8bit"):
+        with pytest.raises(ValueError, match="cannot edit bitsandbytes"):
+            AbliterixConfig(
+                model={"model_id": "x", "quant_method": qm},
+                steering={"steering_mode": "direct"},
+            )
+
+
+def test_bnb_quant_with_lora_steering_allowed():
+    """bnb + lora is the supported combo (frozen base, BF16 adapter)."""
+    cfg = AbliterixConfig(
+        model={"model_id": "x", "quant_method": "bnb_4bit"},
+        steering={"steering_mode": "lora"},
+    )
+    assert cfg.model.quant_method == QuantMode.BNB_4BIT
+
+
 def test_cli_override_batch_size():
     old_argv = sys.argv
     try:

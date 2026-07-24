@@ -43,6 +43,18 @@ def main():
             "adapter (avoids BF16 merge-rounding drift)."
         ),
     )
+    parser.add_argument(
+        "--emit-fp4-plan",
+        default=None,
+        metavar="PLAN.pt",
+        help=(
+            "Record the best trial's resolved direct/EGA edits to this .pt "
+            "file (does not mutate weights or save a model). Replay it against "
+            "a native-FP4 checkpoint with `abliterix-abliterate-fp4 <fp4_dir> "
+            "PLAN.pt <out_dir>` to bake a compact abliterated FP4 model instead "
+            "of a full BF16 merge. Skips the normal merged/adapter export."
+        ),
+    )
     args = parser.parse_args()
 
     os.environ["AX_CONFIG"] = args.config
@@ -104,6 +116,34 @@ def main():
 
     del benign, target
     flush_memory()
+
+    # FP4 plan-only path: record the resolved edits and stop, so they can be
+    # replayed offline against the FP4 checkpoint (no BF16 merge / upload).
+    if args.emit_fp4_plan is not None:
+        from abliterix.core.fp4_repack import (
+            record_steering_plan_from_trial,
+            save_plan,
+        )
+
+        print(f"\nRecording FP4 steering plan to {args.emit_fp4_plan}...")
+        edits = record_steering_plan_from_trial(
+            engine,
+            vectors,
+            direction_index,
+            parameters,
+            config,
+            benign_states=benign_states,
+            target_states=target_states,
+        )
+        save_plan(edits, args.emit_fp4_plan)
+        n_ega = sum(1 for e in edits if e.kind == "ega")
+        n_direct = sum(1 for e in edits if e.kind == "direct")
+        print(
+            f"Plan saved: {n_ega} EGA + {n_direct} direct edits. Bake with:\n"
+            f"  abliterix-abliterate-fp4 <fp4_snapshot_dir> "
+            f"{args.emit_fp4_plan} <out_dir>"
+        )
+        return
 
     # Apply steering
     print("Applying steering (direct weight editing)...")

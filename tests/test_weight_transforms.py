@@ -15,10 +15,12 @@ from abliterix.weight_transforms import (
     DirectTransform,
     apply_biprojected_transform,
     apply_direct_transform,
+    apply_ega_projection,
     apply_householder_transform,
     apply_orba_transform,
     apply_standard_transform,
     double_gram_schmidt,
+    resolve_ega_axis,
 )
 
 
@@ -289,3 +291,88 @@ def test_dispatcher_rejects_unknown_transform():
     d = _rand_unit(W.shape[1])
     with pytest.raises(ValueError):
         apply_direct_transform("does_not_exist", W, d, None)
+
+
+# ---------------------------------------------------------------------------
+# EGA helpers — single source of truth for the fused-expert projection shared
+# by the HF engine path and the offline FP4 repack tool.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_ega_axis_all_cases():
+    # (E, d0=hidden, d1=inter) standard MoE → project output axis (False).
+    assert resolve_ega_axis((4, 16, 32), 16) is False
+    # (E, d0=inter, d1=hidden) → project input axis (True).
+    assert resolve_ega_axis((4, 32, 16), 16) is True
+    # Ambiguous square (hidden == inter) → prefer standard/output (False).
+    assert resolve_ega_axis((4, 16, 16), 16) is False
+    # Transposed (gpt-oss): hidden is last axis.
+    assert resolve_ega_axis((4, 16, 16), 16, transposed=True) is True
+    assert resolve_ega_axis((4, 32, 16), 16, transposed=True) is True
+    assert resolve_ega_axis((4, 16, 32), 16, transposed=True) is None
+    # Neither axis matches → skip.
+    assert resolve_ega_axis((4, 8, 9), 16) is None
+    # Not 3-D → skip.
+    assert resolve_ega_axis((16, 32), 16) is None
+
+
+def _ega_reference(W_all, vf, strength, axis_is_in, norm_preserve):
+    """Inline EGA math copied verbatim from the pre-refactor engine path."""
+    W_all = W_all.to(torch.float32)
+    if axis_is_in:
+        proj = torch.matmul(W_all, vf)
+        W_new = W_all - strength * (proj.unsqueeze(-1) * vf.view(1, 1, -1))
+    else:
+        proj = torch.einsum("o,eoi->ei", vf, W_all)
+        W_new = W_all - strength * (vf.view(1, -1, 1) * proj.unsqueeze(1))
+    if norm_preserve:
+        orig = torch.linalg.vector_norm(W_all, dim=2, keepdim=True)
+        new = torch.linalg.vector_norm(W_new, dim=2, keepdim=True).clamp(min=1e-8)
+        W_new = W_new * (orig / new)
+    return W_new
+
+
+@pytest.mark.parametrize("axis_is_in", [True, False])
+@pytest.mark.parametrize("norm_preserve", [True, False])
+def test_apply_ega_projection_matches_reference(axis_is_in, norm_preserve):
+    torch.manual_seed(7)
+    E, d0, d1 = 5, 12, 20
+    W = torch.randn(E, d0, d1)
+    vf = torch.randn(d1 if axis_is_in else d0)
+    got = apply_ega_projection(
+        W, vf, strength=0.9, axis_is_in=axis_is_in, preserve_row_norm=norm_preserve
+    )
+    exp = _ega_reference(W, vf, 0.9, axis_is_in, norm_preserve)
+    assert torch.allclose(got, exp, atol=1e-6)
+
+
+def test_apply_ega_projection_norm_is_preserved_when_requested():
+    torch.manual_seed(8)
+    W = torch.randn(3, 10, 24)
+    vf = torch.randn(24)  # input axis
+    out = apply_ega_projection(
+        W, vf, strength=1.0, axis_is_in=True, preserve_row_norm=True
+    )
+    before = torch.linalg.vector_norm(W.float(), dim=-1)
+    after = torch.linalg.vector_norm(out, dim=-1)
+    assert torch.allclose(before, after, atol=1e-4)
+
+
+def test_apply_standard_transform_preserve_row_norm_matches_engine_math():
+    """apply_standard_transform(preserve_row_norm=True) == engine direct-standard."""
+    torch.manual_seed(9)
+    out_f, in_f = 16, 24
+    W = torch.randn(out_f, in_f)
+    v = F.normalize(torch.randn(in_f), dim=0)  # input-side direction
+
+    got = apply_standard_transform(W, v, strength=0.8, preserve_row_norm=True)
+
+    # Engine inline reference (core.steering._apply_direct_steering standard path).
+    vf = v.to(torch.float32)
+    W32 = W.to(torch.float32)
+    proj = W32 @ vf
+    W_new = W32 - 0.8 * proj.unsqueeze(1) * vf.unsqueeze(0)
+    orig = torch.linalg.vector_norm(W32, dim=1, keepdim=True)
+    new = torch.linalg.vector_norm(W_new, dim=1, keepdim=True).clamp(min=1e-8)
+    W_new = W_new * (orig / new)
+    assert torch.allclose(got, W_new, atol=1e-6)

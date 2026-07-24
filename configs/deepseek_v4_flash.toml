@@ -14,14 +14,38 @@ non_interactive = true
 #         abliterix-dequant-fp8 on the FP8 portion, then dequants
 #         FP4 expert tensors via the modeling code's own helpers.
 #
-# Why no native FP4/FP8 path:
-#   * abliterix-dequant-fp8 handles block-wise FP8 (non-experts) but not
-#     DeepSeek-V4's FP4 expert layout (NVFP4 e2m1 + ue8m0 scales). The
-#     model's own modeling_deepseek_v4.py is the source of truth; we
-#     trigger its unpacker once at deploy time.
-#   * EGA edits expert mlp.down_proj weights → packed FP4 cannot be
-#     written in place (same lesson as MXFP4 on gpt-oss, see
-#     vllm_live_suppression_dead_end.md).
+# Quantisation layout (MEASURED on the real checkpoint, 2026-07):
+#   DeepSeek-V4-Flash is a three-way hybrid, NOT plain FP8 and NOT NVFP4:
+#     * routed experts  — 4-bit, MXFP4-compatible: e.g.
+#       `layers.L.ffn.experts.N.w1.weight` is I8 [2048, 2048] (4096 nibbles per
+#       row) with `.scale` F8_E8M0 [2048, 128] → E2M1 elements, 32 per block,
+#       power-of-two E8M0 scales.
+#     * shared experts + attention — block-wise FP8 e4m3, 128x128 blocks
+#       (`shared_experts.w1.weight` F8_E4M3 [2048, 4096], scale [16, 32]).
+#     * norms/embeddings — BF16.
+#   Earlier notes here called the experts "NVFP4". That was a mislabel:
+#   e2m1 + ue8m0 + block-32 IS MXFP4. NVFP4 means block-16 + e4m3 block scale
+#   + a per-tensor fp32 global scale, which this model does not use.
+#
+# Two routes:
+#   * This config (BF16 route): dequant everything to BF16 up front, search +
+#     EGA in memory (needs the 568 GB / 4x B200 sizing below). Simplest, and
+#     the search runs on true BF16 weights (no requant noise in the KL loop).
+#   * Compact FP4 route (abliterix.core.fp4_repack): record the resolved edits
+#     with `scripts/export_model.py --emit-fp4-plan plan.pt`, then bake a
+#     standalone 4-bit checkpoint with `abliterix-abliterate-fp4`. Only the
+#     edited tensors are dequant->project->repacked; the rest is copied
+#     through, so the OUTPUT stays ~142 GB instead of a 568 GB BF16 merge.
+#     STATUS for THIS model: the element format is verified (fp4_utils decodes
+#     these experts correctly, round-trip value-identical on real weights), but
+#     the on-disk *layout adapter* is not written yet — `resolve_fp4_keys`
+#     expects gpt-oss's `_blocks`/`_scales` 4-D layout, while DeepSeek uses
+#     `.weight`/`.scale` with a flat 2-D weight and per-expert tensors. Until
+#     that adapter lands, use the BF16 route here; the FP4 route is validated
+#     end to end on gpt-oss-20b (refusals 24/24 -> 0/24, KL 0.134).
+#   The old "packed FP4 cannot be written in place" limitation
+#   (vllm_live_suppression_dead_end.md) referred to *live* in-VRAM editing
+#   under vLLM; the offline repack sidesteps it by rebuilding the checkpoint.
 #
 # Why HF backend, not vLLM (verified 2026-05-05):
 #   vLLM 0.20.0+ supports DSV4-Flash inference natively (PR #40760, merged

@@ -167,8 +167,9 @@ For MoE-specific steering mechanisms (EGA, expert profiling, router suppression)
 Abliterix auto-detects available accelerators (CUDA, XPU, MLU, MUSA, SDAA, NPU, MPS) and distributes layers across devices with `device_map = "auto"`.
 
 For large models:
-- **4-bit quantization**: `--model.quant-method bnb_4bit` cuts VRAM by ~4x
+- **4-bit quantization**: `--model.quant-method bnb_4bit` cuts VRAM by ~4x (LoRA mode; the quantised base stays frozen and the ablation rides in a BF16 adapter)
 - **8-bit quantization**: `--model.quant-method bnb_8bit` — higher quality than 4-bit, ~2x VRAM reduction with CPU offload
+- **Native FP4 models** (gpt-oss MXFP4): abliterate and re-pack **without a BF16 blow-up** via `abliterix-abliterate-fp4` — the output stays 4-bit and serves natively on vLLM. Validated end to end on gpt-oss-20b. DeepSeek-V4-Flash's routed experts use the same MXFP4 element format (verified) but a different on-disk layout, so they still need the BF16 route until the adapter lands. See [docs/fp4_repack.md](docs/fp4_repack.md).
 - **Per-device memory limits**: set `[model] max_memory = {"0": "20GB", "cpu": "64GB"}` in your config
 - **Non-interactive mode**: `--non-interactive` for fully automated batch runs
 
@@ -190,6 +191,7 @@ The deep details live in `docs/` and `benchmarks/`:
 - **[docs/evaluation.md](docs/evaluation.md)** — why most abliteration benchmarks lie, our standards, and the architecture A/B test.
 - **[docs/evidence_resources.md](docs/evidence_resources.md)** — GPU/API/storage resources needed to turn method claims into reproducible evidence.
 - **[docs/moe.md](docs/moe.md)** — the four independent MoE steering mechanisms and supported MoE models.
+- **[docs/fp4_repack.md](docs/fp4_repack.md)** — abliterate native FP4 (MXFP4/NVFP4) models and re-pack to 4-bit offline, no BF16 blow-up.
 - **[docs/configuration.md](docs/configuration.md)** — config loading order, the 150+ shipped configs, the Web UI, and research-mode visualization.
 - **[docs/datasets.md](docs/datasets.md)** — bilingual dataset design rationale and metadata schema.
 - **[docs/references.md](docs/references.md)** — paper references and BibTeX.

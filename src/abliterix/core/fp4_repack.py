@@ -97,10 +97,19 @@ def apply_tensor_edit(W: Tensor, edit: TensorEdit) -> Tensor:
     """
     W32 = W.to(torch.float32)
     if edit.kind == "ega":
-        if W32.dim() != 3:
+        # Producers differ in how experts are stored: gpt-oss fuses them into a
+        # 3-D (E, d0, d1) parameter, DeepSeek-V4 keeps one 2-D (out, in) tensor
+        # per expert. Give the 2-D case a singleton expert axis so BOTH run the
+        # identical kernel — the abliteration fingerprint must not depend on
+        # how the checkpoint happens to group experts.
+        per_expert_2d = W32.dim() == 2
+        if per_expert_2d:
+            W32 = W32.unsqueeze(0)
+        elif W32.dim() != 3:
             raise ValueError(
-                f"EGA edit '{edit.logical_name}' expects a 3-D fused expert "
-                f"tensor, got shape {tuple(W32.shape)}"
+                f"EGA edit '{edit.logical_name}' expects a fused 3-D expert "
+                f"tensor or a 2-D single-expert weight, got shape "
+                f"{tuple(W.shape)}"
             )
         hidden = edit.hidden_dim
         if hidden is None:
@@ -113,13 +122,14 @@ def apply_tensor_edit(W: Tensor, edit: TensorEdit) -> Tensor:
                 f"EGA edit '{edit.logical_name}': hidden dim {hidden} matches "
                 f"neither axis of {tuple(W32.shape)} (transposed={edit.transposed})"
             )
-        return apply_ega_projection(
+        out = apply_ega_projection(
             W32,
             edit.direction,
             strength=edit.strength,
             axis_is_in=axis_is_in,
             preserve_row_norm=edit.preserve_row_norm,
         )
+        return out.squeeze(0) if per_expert_2d else out
 
     # Direct 2-D weight.
     if W32.dim() != 2:
@@ -347,6 +357,64 @@ def record_steering_plan(
     return edits
 
 
+def build_per_expert_ega_plan(
+    steering_vectors: Tensor,
+    profiles: dict,
+    *,
+    n_layers: int,
+    n_experts: int,
+    hidden_dim: int,
+    kernel: DecayKernel = DecayKernel.LINEAR,
+    preserve_row_norm: bool = True,
+    name_template: str = "layers.{layer}.ffn.experts.{expert}.w2",
+    global_vector: Tensor | None = None,
+    discriminative_layers: set[int] | None = None,
+    component: str = "mlp.down_proj",
+) -> list[TensorEdit]:
+    """Build an EGA plan for checkpoints that store one tensor per expert.
+
+    :func:`record_steering_plan` walks a *loaded* model and finds one fused 3-D
+    expert parameter per layer. Producers like DeepSeek-V4-Flash instead store
+    ``layers.{L}.ffn.experts.{N}.w2`` — 43 x 256 separate 2-D tensors — which
+    is far too many to hand-write and needs no model to enumerate. This emits
+    one :class:`TensorEdit` per (layer, expert) using the same per-layer decay
+    and the same projection kernel as the fused path, so the two produce the
+    same abliteration for the same profile.
+
+    ``w2`` is the down-projection in the w1/w2/w3 convention (w1 gate, w3 up),
+    i.e. the tensor EGA targets. ``name_template`` is formatted with ``layer``
+    and ``expert``.
+    """
+    sp = profiles.get(component)
+    if sp is None:
+        return []
+    edits: list[TensorEdit] = []
+    for layer_idx in range(n_layers):
+        if discriminative_layers is not None and layer_idx not in discriminative_layers:
+            continue
+        strength = _layer_strength(sp, layer_idx, kernel)
+        if strength is None:
+            continue
+        v = _steering_vector_for(steering_vectors, global_vector, layer_idx)
+        if v.ndim != 1:
+            continue
+        vf = v.to(torch.float32).detach().cpu()
+        for expert_idx in range(n_experts):
+            edits.append(
+                TensorEdit(
+                    logical_name=name_template.format(
+                        layer=layer_idx, expert=expert_idx
+                    ),
+                    kind="ega",
+                    direction=vf.clone(),
+                    strength=strength,
+                    preserve_row_norm=preserve_row_norm,
+                    hidden_dim=hidden_dim,
+                )
+            )
+    return edits
+
+
 def record_steering_plan_from_trial(
     engine,
     steering_vectors: Tensor,
@@ -398,48 +466,143 @@ class _Fp4KeySet:
     global_scale: str | None = None  # per-tensor fp32 (NVFP4 only)
 
 
-# Suffix candidates seen across producers. MXFP4 (gpt-oss) uses
-# ``_blocks``/``_scales``; NVFP4 (ModelOpt / llm-compressor) stores the packed
-# weight under the bare name plus ``_scale`` (+ a ``_scale_2`` / global).
-_MX_BLOCK_SUFFIXES = ("_blocks",)
-_MX_SCALE_SUFFIXES = ("_scales",)
-_NV_SCALE_SUFFIXES = ("_scale", "_weight_scale")
-_NV_GLOBAL_SUFFIXES = (
-    "_scale_2",
-    "_weight_scale_2",
-    "_global_scale",
-    "_weight_global_scale",
+# ---------------------------------------------------------------------------
+# On-disk layouts
+#
+# The *element* format (E2M1 + block scale) is shared, but every producer wraps
+# it differently: key suffixes, packed rank, and whether the model transposes
+# the decoded tensor. Declare those differences once here instead of
+# special-casing them at each call site.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Fp4Layout:
+    """How one producer stores an FP4 tensor on disk.
+
+    ``weight_suffix`` / ``scale_suffix`` are appended to the *logical* tensor
+    name to get the safetensors keys. ``packed_ndim`` is the rank of the stored
+    packed tensor: 4 for gpt-oss's fused ``(E, rows, n_blocks, bytes)``, 2 for
+    DeepSeek's flat per-expert ``(out, in/2)``. ``model_transposes`` records
+    that the model's own dequant ends with ``transpose(1, 2)`` (gpt-oss only).
+    """
+
+    name: str
+    weight_suffix: str
+    scale_suffix: str
+    packed_ndim: int
+    model_transposes: bool
+    global_suffixes: tuple[str, ...] = ()
+
+
+# gpt-oss / transformers MXFP4: `<name>_blocks` (E, rows, n_blocks, 16) uint8
+# + `<name>_scales` (E, rows, n_blocks) uint8. Reference dequant transposes.
+GPT_OSS_LAYOUT = Fp4Layout("gpt_oss", "_blocks", "_scales", 4, True)
+
+# DeepSeek-V4-Flash: `<name>.weight` I8 (out, in/2) + `<name>.scale` F8_E8M0
+# (out, in/32) — flat 2-D, one tensor per expert, no model-side transpose.
+# Measured on the real checkpoint; E2M1 + power-of-two E8M0 scales, block 32,
+# i.e. the same MXFP4 math fp4_utils already decodes bit-exactly.
+DEEPSEEK_V4_LAYOUT = Fp4Layout("deepseek_v4", ".weight", ".scale", 2, False)
+
+# NVFP4 (ModelOpt / llm-compressor): packed weight under the bare name plus a
+# `_scale` block scale and a per-tensor global. Implemented, unvalidated.
+NVFP4_LAYOUT = Fp4Layout(
+    "nvfp4",
+    "",
+    "_scale",
+    2,
+    False,
+    ("_scale_2", "_weight_scale_2", "_global_scale", "_weight_global_scale"),
 )
+
+_ALL_LAYOUTS = (GPT_OSS_LAYOUT, DEEPSEEK_V4_LAYOUT, NVFP4_LAYOUT)
+
+
+def detect_layout(present: set[str], fmt: f4.Fp4Format) -> Fp4Layout | None:
+    """Infer the on-disk layout from the keys actually in the checkpoint."""
+    if any(k.endswith("_blocks") for k in present):
+        return GPT_OSS_LAYOUT
+    if fmt.kind == "nvfp4":
+        return NVFP4_LAYOUT
+    if any(k.endswith(".scale") for k in present):
+        return DEEPSEEK_V4_LAYOUT
+    return None
 
 
 def resolve_fp4_keys(
-    logical_name: str, present: set[str], fmt: f4.Fp4Format
+    logical_name: str,
+    present: set[str],
+    fmt: f4.Fp4Format,
+    layout: Fp4Layout | None = None,
 ) -> _Fp4KeySet | None:
     """Find the FP4 sibling keys for ``logical_name`` among ``present`` keys.
 
-    Returns ``None`` if the tensor is not FP4-encoded under this layout (e.g.
-    it is a plain BF16 weight that should be edited without repacking).
+    ``layout`` defaults to trying every known producer, so callers that do not
+    care (tests, one-off tools) keep working. Returns ``None`` if the tensor is
+    not FP4-encoded under any layout — e.g. a plain BF16 weight that should be
+    edited without repacking.
     """
-    if fmt.kind == "mxfp4":
-        for bsuf in _MX_BLOCK_SUFFIXES:
-            for ssuf in _MX_SCALE_SUFFIXES:
-                b, s = logical_name + bsuf, logical_name + ssuf
-                if b in present and s in present:
-                    return _Fp4KeySet(b, s)
-        return None
-    # NVFP4: packed weight under the bare name + a block scale sibling.
-    if logical_name not in present:
-        return None
-    for ssuf in _NV_SCALE_SUFFIXES:
-        s = logical_name + ssuf
-        if s in present:
+    for lay in (layout,) if layout is not None else _ALL_LAYOUTS:
+        w = logical_name + lay.weight_suffix
+        s = logical_name + lay.scale_suffix
+        if w in present and s in present:
             g = None
-            for gsuf in _NV_GLOBAL_SUFFIXES:
+            for gsuf in lay.global_suffixes:
                 if logical_name + gsuf in present:
                     g = logical_name + gsuf
                     break
-            return _Fp4KeySet(logical_name, s, g)
+            return _Fp4KeySet(w, s, g)
     return None
+
+
+def _as_blocked(blocks: Tensor, scales: Tensor) -> Tensor:
+    """Reshape a flat packed weight so its last axis is one block's bytes.
+
+    gpt-oss already stores ``(..., n_blocks, bytes)``. DeepSeek stores the
+    packed weight flat as ``(out, in/2)`` with scales ``(out, n_blocks)``, so
+    split the byte axis into ``(out, n_blocks, bytes_per_block)`` before the
+    kernel sees it. Detected from the shapes, not hard-coded per producer.
+    """
+    if blocks.dim() == scales.dim() + 1:
+        return blocks  # already blocked: scales index every axis but the bytes
+    n_blocks = scales.shape[-1]
+    if blocks.shape[-1] % n_blocks != 0:
+        raise ValueError(
+            f"packed last axis {blocks.shape[-1]} not divisible by "
+            f"{n_blocks} blocks — layout mismatch"
+        )
+    return blocks.reshape(*blocks.shape[:-1], n_blocks, blocks.shape[-1] // n_blocks)
+
+
+def _as_flat(blocks: Tensor, like: Tensor) -> Tensor:
+    """Inverse of :func:`_as_blocked`: restore the producer's stored shape."""
+    return blocks.reshape(like.shape) if blocks.shape != like.shape else blocks
+
+
+def _store_as(t: Tensor, like: Tensor) -> Tensor:
+    """Bit-preserving cast of a ``uint8`` payload back to the producer's dtype.
+
+    Packed nibbles and E8M0 scales are **byte payloads, not numbers**. DeepSeek
+    stores them as ``int8`` / ``float8_e8m0fnu``, so ``.to(dtype)`` would
+    *convert*: any packed byte above 127 (i.e. every pair whose high nibble is
+    negative) would clamp to 127, and a scale byte would be reinterpreted as a
+    float value. Bit-cast instead.
+    """
+    if t.dtype == like.dtype:
+        return t
+    return t.contiguous().view(like.dtype)
+
+
+def _scale_bytes(scales: Tensor) -> Tensor:
+    """View a block-scale tensor as the ``uint8`` biased exponent the kernel wants.
+
+    DeepSeek stores E8M0 scales as ``torch.float8_e8m0fnu``; its bit pattern is
+    exactly the ue8m0 biased exponent (value ``2**(byte-127)``) that
+    :func:`fp4_utils.dequantize_mxfp4` already expects, so this is a bit-cast,
+    not a conversion.
+    """
+    return scales if scales.dtype == torch.uint8 else scales.view(torch.uint8)
 
 
 def _packed_moe_is_transposed(blocks: Tensor) -> bool:
@@ -480,11 +643,12 @@ def _dequant_fp4_tensor(
     Siblings are pulled onto ``blocks``' device: a shard's tensors may be a
     mix of freshly-repacked GPU tensors and untouched CPU ones.
     """
-    blocks = tensors[keys.blocks]
-    scales = tensors[keys.scales].to(blocks.device)
-    g = tensors[keys.global_scale].to(blocks.device) if keys.global_scale else None
+    stored = tensors[keys.blocks]
+    scales = _scale_bytes(tensors[keys.scales].to(stored.device))
+    blocks = _as_blocked(stored, scales)
+    g = tensors[keys.global_scale].to(stored.device) if keys.global_scale else None
     W = f4.dequantize_fp4(fmt, blocks, scales, global_scale=g, out_dtype=torch.float32)
-    return _to_logical(W, _packed_moe_is_transposed(blocks))
+    return _to_logical(W, _packed_moe_is_transposed(stored))
 
 
 def _requant_fp4_tensor(
@@ -507,19 +671,48 @@ def _requant_fp4_tensor(
     g = orig.get(keys.global_scale) if keys.global_scale else None
     if g is not None:
         g = g.to(W.device)  # plan/shard tensors are CPU; W may be on GPU
-    W = _to_ondisk(W, _packed_moe_is_transposed(orig[keys.blocks]))
+    stored = orig[keys.blocks]
+    W = _to_ondisk(W, _packed_moe_is_transposed(stored))
     blocks, scales, new_g = f4.quantize_fp4(
         fmt, W, global_scale=g, scale_search=scale_search
     )
+    # Restore the producer's stored shape (flat for DeepSeek) and byte dtype.
     out: dict[str, Tensor] = {
-        keys.blocks: blocks.to(orig[keys.blocks].dtype),
-        keys.scales: scales.to(orig[keys.scales].dtype),
+        keys.blocks: _store_as(_as_flat(blocks, stored), stored),
+        keys.scales: _store_as(scales, orig[keys.scales]),
     }
     if keys.global_scale is not None:
         out[keys.global_scale] = (
             new_g if new_g is not None else orig[keys.global_scale]
         ).to(orig[keys.global_scale].dtype)
     return out
+
+
+def _assert_layout_roundtrip(
+    src: dict[str, Tensor],
+    keys: _Fp4KeySet,
+    fmt: f4.Fp4Format,
+    *,
+    name: str = "<tensor>",
+) -> None:
+    """Verify the FULL repack path is a fixed point on unedited weights.
+
+    Stronger than the kernel-level check in :mod:`fp4_utils`: this runs the
+    producer's real bytes through dequant → requant → dequant, so a wrong
+    reshape (flat vs blocked), a lossy dtype cast (int8 clamping a packed byte
+    above 127), or a bad transpose shows up as value drift here rather than as
+    silently corrupted weights on disk.
+    """
+    W0 = _dequant_fp4_tensor(src, keys, fmt)
+    re = _requant_fp4_tensor(W0, keys, fmt, src, scale_search=0)
+    W1 = _dequant_fp4_tensor({**src, **re}, keys, fmt)
+    if not torch.equal(W0, W1):
+        drift = (W0 - W1).abs().max().item()
+        raise AssertionError(
+            f"FP4 repack of '{name}' is not a fixed point on unedited weights "
+            f"(max drift {drift:g}) — the on-disk layout handling (shape, byte "
+            "dtype, or orientation) does not match this producer."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +755,7 @@ def abliterate_fp4_to_disk(
     edits: Iterable[TensorEdit],
     *,
     fmt: f4.Fp4Format | None = None,
+    layout: Fp4Layout | None = None,
     use_cuda: bool = True,
     verify_idempotent: bool = True,
     reference_dequant: Any = None,
@@ -620,6 +814,14 @@ def abliterate_fp4_to_disk(
     remaining = set(edit_by_name)
     stats = RepackStats()
     shards = _iter_shards(src_dir)
+
+    if layout is None:
+        layout = detect_layout({k for ks in shards.values() for k in ks}, fmt)
+    if verbose:
+        print(
+            f"* FP4 {fmt.kind} (block {fmt.block_size}), on-disk layout: "
+            f"{layout.name if layout else 'unknown — trying all'}"
+        )
     new_weight_map: dict[str, str] = {}
     total_bytes = 0
     t0 = time.time()
@@ -633,21 +835,11 @@ def abliterate_fp4_to_disk(
         consumed: set[str] = set()
 
         for name, edit in edit_by_name.items():
-            fp4_keys = resolve_fp4_keys(name, present, fmt)
+            fp4_keys = resolve_fp4_keys(name, present, fmt, layout)
             if fp4_keys is not None:
                 W = _dequant_fp4_tensor(src, fp4_keys, fmt).to(device)
                 if verify_idempotent:
-                    f4.assert_repack_idempotent(
-                        src[fp4_keys.blocks].to(device),
-                        src[fp4_keys.scales].to(device),
-                        fmt,
-                        global_scale=(
-                            src[fp4_keys.global_scale].to(device)
-                            if fp4_keys.global_scale
-                            else None
-                        ),
-                        name=name,
-                    )
+                    _assert_layout_roundtrip(src, fp4_keys, fmt, name=name)
                 if reference_dequant is not None:
                     ref = reference_dequant(name, W)
                     if ref is not None:

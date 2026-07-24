@@ -107,20 +107,36 @@ reference dequant ends with a `transpose(1, 2)`, so the weight the model sees is
 `(E, K, rows)`; `fp4_repack` rotates to that orientation before editing and back
 before writing (see `_packed_moe_is_transposed`).
 
-**DeepSeek-V4-Flash (element format verified, layout adapter NOT yet written):**
-its routed experts are **MXFP4-compatible** — measured on the real checkpoint:
-`layers.L.ffn.experts.N.w1.weight` is `I8 [2048, 2048]` (4096 nibbles/row) with
-`.scale` `F8_E8M0 [2048, 128]`, i.e. **32 elements per block, E2M1 elements,
-power-of-two E8M0 scales** — the same math `fp4_utils` already decodes
-bit-exactly. (The model is a three-way hybrid: routed experts 4-bit, shared
-experts + attention block-wise FP8 e4m3 128×128, plus some BF16.)
+**DeepSeek-V4-Flash (supported):** its routed experts are **MXFP4-format** —
+measured on the real checkpoint, `layers.L.ffn.experts.N.w2.weight` is
+`I8 [4096, 1024]` (2048 nibbles/row) with `.scale` `F8_E8M0 [4096, 64]`, i.e.
+**32 elements per block, E2M1 elements, power-of-two E8M0 scales** — the same
+math `fp4_utils` decodes bit-exactly, just packaged differently:
+`.weight`/`.scale` instead of `_blocks`/`_scales`, a flat 2-D weight instead of
+4-D, and one tensor per expert instead of a fused 3-D parameter. `Fp4Layout`
+declares those differences; `apply_tensor_edit` gives a 2-D single-expert weight
+a singleton expert axis so both producers run the identical projection kernel.
 
-What is missing is purely a *layout adapter*, not new math:
-`resolve_fp4_keys` looks for `_blocks`/`_scales`, while DeepSeek uses
-`.weight`/`.scale`; the weight is flat 2-D `[out, in/2]` rather than 4-D and
-needs a reshape to `[out, n_blocks, bytes]`; the scale is `F8_E8M0` (viewable as
-`uint8`); and experts are separate per-index tensors rather than one fused 3-D
-parameter, so EGA would loop per expert instead of vectorising.
+Because 43 × 256 = 11008 per-expert edits are not hand-writable (and need no
+loaded model to enumerate), use `build_per_expert_ega_plan`:
+
+```python
+plan = build_per_expert_ega_plan(
+    steering_vectors, profiles,
+    n_layers=43, n_experts=256, hidden_dim=4096,
+)   # -> layers.{L}.ffn.experts.{N}.w2
+```
+
+The model is a **three-way hybrid**: routed experts 4-bit (141.7 GB, 88.8% of
+the checkpoint), shared experts + attention block-wise FP8 e4m3 128×128, plus
+some BF16. Only the 4-bit part is in scope here — the FP8 tensors are
+`fp8_utils` territory, so `attn.wo_b` is *not* edited by this path.
+
+> One packaging detail worth knowing if you add another producer: DeepSeek
+> stores packed nibbles as **signed `int8`** and scales as `float8_e8m0fnu`.
+> These are byte payloads, not numbers — `.to(torch.int8)` would clamp every
+> packed byte above 127 (any pair whose high nibble is negative) to 127. The
+> repack path bit-casts (`_store_as`) rather than converting.
 
 > Older notes in this repo described DeepSeek-V4's experts as "NVFP4". That is a
 > mislabel: `e2m1 + ue8m0 + block 32` is MXFP4. NVFP4 (block 16, e4m3 scale,

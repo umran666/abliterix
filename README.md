@@ -30,6 +30,7 @@ It also ships **HonestAbliterationBench**, a reproducible public benchmark that 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [How It Works](#how-it-works)
 - [Broken Defenses](#broken-defenses)
 - [Results](#results)
 - [Honest Abliteration Leaderboard](#honest-abliteration-leaderboard)
@@ -57,6 +58,35 @@ That's it. The process is fully automatic — after optimization completes, you 
 > **Reproducible install (recommended)**: Abliterix uses [uv](https://docs.astral.sh/uv/) and commits a `uv.lock` pinning every dependency, plus a `[tool.uv] exclude-newer` cutoff so lock regeneration can't drift onto a newer dep that breaks the GPU path. If you use uv, clone the repo and run `uv run abliterix --model <model>` to get the exact dependency set the maintainers tested against.
 
 > **Windows**: use `python scripts/run_abliterix.py --model <model>` or set `PYTHONIOENCODING=utf-8` to avoid Rich encoding issues.
+
+
+## How It Works
+
+Abliterix modifies model internals rather than relying on prompt-level jailbreaks. Its basic assumption is that benign prompts and prompts that trigger refusal produce measurably different activation patterns in the model's residual stream.
+
+For each layer, let \(g\) be the mean activation for benign prompts and \(b\) the mean activation for target prompts. The simplest refusal direction is:
+
+\[
+r = \operatorname{normalize}(b-g)
+\]
+
+Abliteration removes weight components aligned with this direction. A simplified input-side transformation is:
+
+\[
+W' = W-\alpha(Wr)r^\top
+\]
+
+where \(\alpha\) controls the intervention strength. In practice, Abliterix can apply the corresponding projection on either side of a weight matrix, depending on whether a module reads from or writes to the residual stream.
+
+The automated pipeline is:
+
+1. **Extract activations** — run benign and target prompt sets through the original model and capture hidden states from every layer.
+2. **Derive steering vectors** — compute a refusal direction or subspace using mean difference, PCA, SRA, SAE, SOM, optimal transport, RDO, or other configured methods.
+3. **Apply candidate edits** — modify attention, MLP, and, where applicable, MoE expert/router components using reversible LoRA adapters, direct weight projections, or runtime steering hooks.
+4. **Evaluate the trade-off** — count refusals on target prompts while measuring KL divergence and generation quality against the untouched model on benign prompts.
+5. **Optimize automatically** — use Optuna TPE to search layer locations, component strengths, decay profiles, vector scope, and MoE routing parameters. The result is a Pareto frontier balancing fewer refusals against less behavioral drift.
+
+In short, Abliterix identifies refusal-related geometry in hidden space, suppresses it in the model, and automatically searches for the least damaging effective intervention. See [docs/architecture.md](docs/architecture.md) for the full pipeline and [docs/methods.md](docs/methods.md) for the available steering methods.
 
 
 ## Broken Defenses

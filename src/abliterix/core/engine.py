@@ -2004,7 +2004,6 @@ class SteeringEngine:
             self._generate(
                 message_batch,
                 max_new_tokens=token_count,
-                min_new_tokens=token_count,
                 logits_processor=[sampler, forcing],
             )
             all_logprobs.append(_captured_logprobs(sampler, token_count))

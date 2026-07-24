@@ -80,12 +80,37 @@ class _PrefixSensitiveModel:
         return input_ids
 
 
+class _MinNewTokensAwareModel(_PrefixSensitiveModel):
+    """Apply the EOS mask that Transformers adds before custom processors."""
+
+    def generate(self, input_ids, attention_mask, **kwargs):
+        for step in range(kwargs["max_new_tokens"]):
+            scores = self._scores(input_ids, attention_mask)[:, -1, :]
+            if step < kwargs.get("min_new_tokens", 0):
+                scores = scores.clone()
+                scores[:, 3] = float("-inf")
+            for processor in kwargs["logits_processor"]:
+                scores = processor(input_ids, scores)
+            next_token = scores.argmax(dim=-1, keepdim=True)
+            input_ids = torch.cat((input_ids, next_token), dim=1)
+            attention_mask = torch.cat(
+                (attention_mask, torch.ones_like(next_token)), dim=1
+            )
+        return input_ids
+
+
 def _make_teacher_forcing_engine(batch_size: int = 2) -> SteeringEngine:
     engine = object.__new__(SteeringEngine)
     engine.config = SimpleNamespace(inference=SimpleNamespace(batch_size=batch_size))
     engine.response_prefix = ""
     engine.tokenizer = _TeacherForcingTokenizer()
     engine.model = _PrefixSensitiveModel()
+    return engine
+
+
+def _make_min_new_tokens_aware_engine() -> SteeringEngine:
+    engine = _make_teacher_forcing_engine()
+    engine.model = _MinNewTokensAwareModel()
     return engine
 
 
@@ -189,6 +214,22 @@ def test_score_continuation_logprobs_single_token_keeps_legacy_2d_shape():
 
     assert actual.shape == (1, 4)
     assert actual.dtype == torch.float32
+
+
+def test_score_continuation_logprobs_returns_complete_finite_distribution():
+    engine = _make_min_new_tokens_aware_engine()
+
+    actual = engine.score_continuation_logprobs_batched(
+        [ChatMessage(system="", user="prompt-a")],
+        ["base-a"],
+        token_count=1,
+    )
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        torch.logsumexp(actual, dim=-1),
+        torch.zeros(1),
+    )
 
 
 def test_score_continuation_logprobs_rejects_short_continuation():

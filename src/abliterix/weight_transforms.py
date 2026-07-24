@@ -104,12 +104,20 @@ def apply_standard_transform(
     refusal: Tensor,
     *,
     strength: float = 1.0,
+    preserve_row_norm: bool = False,
 ) -> Tensor:
     """The plain rank-1 ablation used by the historical direct path.
 
     ``W_new = W - strength · (W · d) ⊗ d`` where ``d`` is assumed
-    unit-normalised. No row-norm post-step here — the caller handles
-    norm preservation via :class:`WeightNorm`.
+    unit-normalised.
+
+    ``preserve_row_norm`` reproduces the engine's post-step (see
+    :func:`core.steering._apply_direct_steering`): every output row (dim 1,
+    the ``out_features`` axis) is rescaled to its original L2 norm. It is
+    exposed here so the offline repack path
+    (:mod:`abliterix.core.fp4_repack`) reproduces the in-engine direct-mode
+    edit exactly; leave it ``False`` to get the bare projection (the
+    historical helper behaviour, kept for existing callers).
     """
     d = _normalise(refusal.to(dtype=torch.float32))
     W32 = W.to(dtype=torch.float32)
@@ -124,7 +132,87 @@ def apply_standard_transform(
             f"Refusal direction shape {d.shape} does not match either axis "
             f"of W shape {W32.shape}."
         )
+    if preserve_row_norm:
+        orig_norms = torch.linalg.vector_norm(W32, dim=1, keepdim=True)
+        new_norms = torch.linalg.vector_norm(new_W, dim=1, keepdim=True).clamp(min=1e-8)
+        new_W = new_W * (orig_norms / new_norms)
     return new_W.to(W.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Expert-Granular Abliteration (EGA) — per-expert rank-1 projection on a
+# fused 3-D expert weight. Single source of truth shared by the in-engine HF
+# path (core.steering._apply_ega_steering) and the offline repack tool
+# (core.fp4_repack), so the abliteration fingerprint is bit-identical across
+# both. Mirrors the vLLM TP-worker kernel in core.vllm_moe_editor.
+# ---------------------------------------------------------------------------
+
+
+def resolve_ega_axis(
+    fused_shape: tuple[int, ...],
+    hidden_dim: int,
+    *,
+    transposed: bool = False,
+) -> bool | None:
+    """Decide which axis of a fused expert tensor the refusal direction lives on.
+
+    ``fused_shape`` is ``(E, d0, d1)``. Returns:
+        ``True``  — project the last/input axis (``d1``); direction has len d1
+        ``False`` — project the ``d0``/output axis; direction has len d0
+        ``None``  — ``hidden_dim`` matches neither axis; caller should skip
+
+    ``transposed=True`` forces the gpt-oss layout where hidden is the input
+    (last) axis. For the ambiguous square case (``d0 == d1 == hidden``) the
+    standard (output-axis) convention is chosen, matching both the HF and
+    vLLM EGA kernels.
+    """
+    if len(fused_shape) != 3:
+        return None
+    _, d0, d1 = fused_shape
+    if transposed:
+        return True if d1 == hidden_dim else None
+    if d0 == hidden_dim and d1 != hidden_dim:
+        return False
+    if d1 == hidden_dim and d0 != hidden_dim:
+        return True
+    if d0 == hidden_dim:
+        return False  # ambiguous square → prefer standard/output axis
+    return None
+
+
+def apply_ega_projection(
+    W: Tensor,
+    refusal: Tensor,
+    *,
+    strength: float,
+    axis_is_in: bool,
+    preserve_row_norm: bool = True,
+) -> Tensor:
+    """Per-expert rank-1 orthogonal projection on a fused 3-D expert weight.
+
+    ``W`` has shape ``(E, d0, d1)``; ``refusal`` is a 1-D direction whose
+    length matches the projected axis (``d1`` when ``axis_is_in`` else
+    ``d0``). Vectorised over the expert dimension. Returns a new float32
+    tensor; the caller casts back to the storage dtype.
+
+    This is the exact math of ``core.steering._apply_ega_steering`` and the
+    ``_worker_apply_ega_batch`` vLLM kernel — do not diverge it.
+    """
+    W_all = W.to(torch.float32)
+    vf = refusal.to(device=W_all.device, dtype=torch.float32)
+    if axis_is_in:
+        proj = torch.matmul(W_all, vf)  # (E, d0)
+        W_new = W_all - strength * (proj.unsqueeze(-1) * vf.view(1, 1, -1))
+    else:
+        proj = torch.einsum("o,eoi->ei", vf, W_all)  # (E, d1)
+        W_new = W_all - strength * (vf.view(1, -1, 1) * proj.unsqueeze(1))
+    if preserve_row_norm:
+        orig_norms = torch.linalg.vector_norm(W_all, dim=-1, keepdim=True)
+        new_norms = torch.linalg.vector_norm(W_new, dim=-1, keepdim=True).clamp(
+            min=1e-8
+        )
+        W_new = W_new * (orig_norms / new_norms)
+    return W_new
 
 
 def apply_orba_transform(

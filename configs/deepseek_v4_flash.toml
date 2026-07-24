@@ -14,14 +14,23 @@ non_interactive = true
 #         abliterix-dequant-fp8 on the FP8 portion, then dequants
 #         FP4 expert tensors via the modeling code's own helpers.
 #
-# Why no native FP4/FP8 path:
-#   * abliterix-dequant-fp8 handles block-wise FP8 (non-experts) but not
-#     DeepSeek-V4's FP4 expert layout (NVFP4 e2m1 + ue8m0 scales). The
-#     model's own modeling_deepseek_v4.py is the source of truth; we
-#     trigger its unpacker once at deploy time.
-#   * EGA edits expert mlp.down_proj weights → packed FP4 cannot be
-#     written in place (same lesson as MXFP4 on gpt-oss, see
-#     vllm_live_suppression_dead_end.md).
+# FP4 handling — two options now exist:
+#   * This config (BF16 route): dequant everything to BF16 up front, search +
+#     EGA in memory (needs the 568 GB / 4× B200 sizing below). Simplest, and
+#     the search runs on true BF16 weights (no requant noise in the KL loop).
+#   * Compact FP4 route (abliterix.core.fp4_repack): run search/export as
+#     usual, add `--emit-fp4-plan plan.pt` to scripts/export_model.py to record
+#     the resolved direct/EGA edits, then bake a standalone *FP4* checkpoint
+#     with `abliterix-abliterate-fp4 <fp4_snapshot> plan.pt <out>`. Only the
+#     edited tensors are dequant→project→repacked (NVFP4 e2m1 + ue8m0/e4m3
+#     scales); the rest is copied through, so the OUTPUT stays ~142 GB instead
+#     of a 568 GB BF16 merge and serves natively on vLLM. Note: re-quantising
+#     an edited tensor to 4-bit carries ~10-15% mean rel-err (the regime the
+#     base weights already live in) — the tool reports it per tensor; validate
+#     downstream KL on gpt-oss-20b MXFP4 before trusting it here.
+#   The old "packed FP4 cannot be written in place" limitation
+#   (vllm_live_suppression_dead_end.md) referred to *live* in-VRAM editing
+#   under vLLM; the offline repack sidesteps it by rebuilding the checkpoint.
 #
 # Why HF backend, not vLLM (verified 2026-05-05):
 #   vLLM 0.20.0+ supports DSV4-Flash inference natively (PR #40760, merged

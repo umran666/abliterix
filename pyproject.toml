@@ -86,6 +86,7 @@ Changelog = "https://github.com/wuwangzhang1216/abliterix/releases"
 [project.scripts]
 abliterix = "abliterix.cli:main"
 abliterix-dequant-fp8 = "abliterix.scripts.dequant_fp8:main"
+abliterix-abliterate-fp4 = "abliterix.scripts.abliterate_fp4:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

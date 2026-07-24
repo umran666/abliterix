@@ -1956,6 +1956,34 @@ class AbliterixConfig(BaseSettings):
                     "'standard' or steering_mode='lora'."
                 )
 
+        # Direct / EGA steering edits base weights in place, which requires
+        # writable BF16 (or full-precision) ``nn.Parameter`` tensors. A
+        # bitsandbytes-quantised base weight is a packed 4-bit ``Params4bit``
+        # (or int8 ``CB``) blob: ``weight.data.to(float32)`` does NOT dequant
+        # it (it reinterprets the packed bytes) and there is no in-place
+        # requant path, so the edit would silently corrupt every steerable
+        # weight during the search. LoRA mode handles bnb correctly (it keeps
+        # the quantised base frozen and carries the ablation in a BF16
+        # adapter). For a *native* 4-bit checkpoint, edit offline with
+        # ``abliterix-abliterate-fp4`` (dequant → project → repack).
+        if (
+            self.model.quant_method
+            in (
+                QuantMode.BNB_4BIT,
+                QuantMode.BNB_8BIT,
+            )
+            and self.steering.steering_mode == SteeringMode.DIRECT
+        ):
+            raise ValueError(
+                f"steering_mode='direct' cannot edit bitsandbytes "
+                f"{self.model.quant_method.value!r} base weights in place — the "
+                "packed 4-bit/int8 storage is not writable and would be "
+                "silently corrupted. Use steering_mode='lora' (keeps the "
+                "quantised base frozen, ablates via a BF16 adapter), load the "
+                "model unquantized (quant_method='none'), or, for a native-FP4 "
+                "checkpoint, bake offline with `abliterix-abliterate-fp4`."
+            )
+
         # The current vLLM fast path materialises one rank-1 adapter from a
         # ProjectionCache.  Feeding it a stacked ``(rank, layers, hidden)``
         # tensor either indexes the layer axis as the rank axis or silently

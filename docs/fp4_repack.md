@@ -1,7 +1,7 @@
 # Editing native FP4 models without a BF16 blow-up
 
 Ultra-sparse MoE checkpoints now ship pre-quantised to 4 bits — gpt-oss (MXFP4),
-DeepSeek-V4-Flash (NVFP4, 284B), and friends. Abliterix's direct/EGA editing
+DeepSeek-V4-Flash (MXFP4-format routed experts, 284B), and friends. Abliterix's direct/EGA editing
 needs *writable* weights, and the historical answer was to dequantise the whole
 model to BF16 first: a 284B FP4 checkpoint (~142 GB) becomes ~568 GB of BF16 and
 demands 4× B200 just to hold it, most of which is never touched.
@@ -92,14 +92,40 @@ remains**: E2M1 has eight magnitude levels, and no scale choice escapes that.
 
 ## Formats
 
-| Format | Block | Element | Block scale | Global scale |
-|--------|-------|---------|-------------|--------------|
-| MXFP4 (gpt-oss) | 32 | E2M1 (4-bit) | ue8m0 (power-of-two, `uint8`) | — |
-| NVFP4 (DeepSeek-V4) | 16 | E2M1 (4-bit) | e4m3 (FP8) | one `fp32` per tensor |
+| Format | Block | Element | Block scale | Global scale | Status |
+|--------|-------|---------|-------------|--------------|--------|
+| MXFP4 | 32 | E2M1 (4-bit) | ue8m0 (power-of-two) | — | validated on real weights |
+| NVFP4 | 16 | E2M1 (4-bit) | e4m3 (FP8) | one `fp32` per tensor | implemented, **unvalidated** |
 
-On disk, MXFP4 stores `<name>_blocks` + `<name>_scales`; NVFP4 stores the packed
-weight plus a `_scale` (and a `_scale_2` / global) sibling. `fp4_utils` handles
-both; `detect_fp4_format` reads the layout from `quantization_config`.
+`detect_fp4_format` reads the format from `quantization_config`.
+
+### On-disk layouts (they differ per producer — check before trusting)
+
+**gpt-oss (supported end to end):** `<name>_blocks` (`uint8`, 4-D
+`(E, rows, n_blocks, 16)`) + `<name>_scales` (`uint8`, 3-D). transformers'
+reference dequant ends with a `transpose(1, 2)`, so the weight the model sees is
+`(E, K, rows)`; `fp4_repack` rotates to that orientation before editing and back
+before writing (see `_packed_moe_is_transposed`).
+
+**DeepSeek-V4-Flash (element format verified, layout adapter NOT yet written):**
+its routed experts are **MXFP4-compatible** — measured on the real checkpoint:
+`layers.L.ffn.experts.N.w1.weight` is `I8 [2048, 2048]` (4096 nibbles/row) with
+`.scale` `F8_E8M0 [2048, 128]`, i.e. **32 elements per block, E2M1 elements,
+power-of-two E8M0 scales** — the same math `fp4_utils` already decodes
+bit-exactly. (The model is a three-way hybrid: routed experts 4-bit, shared
+experts + attention block-wise FP8 e4m3 128×128, plus some BF16.)
+
+What is missing is purely a *layout adapter*, not new math:
+`resolve_fp4_keys` looks for `_blocks`/`_scales`, while DeepSeek uses
+`.weight`/`.scale`; the weight is flat 2-D `[out, in/2]` rather than 4-D and
+needs a reshape to `[out, n_blocks, bytes]`; the scale is `F8_E8M0` (viewable as
+`uint8`); and experts are separate per-index tensors rather than one fused 3-D
+parameter, so EGA would loop per expert instead of vectorising.
+
+> Older notes in this repo described DeepSeek-V4's experts as "NVFP4". That is a
+> mislabel: `e2m1 + ue8m0 + block 32` is MXFP4. NVFP4 (block 16, e4m3 scale,
+> per-tensor fp32) is implemented here but no shipped target model in this repo
+> is known to use it, and it has never been checked against a real checkpoint.
 
 ## What this does and does not save
 

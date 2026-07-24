@@ -23,7 +23,7 @@ MXFP4 (OCP micro-scaling; gpt-oss)
     * On disk as sibling tensors ``<name>_blocks`` (packed nibbles, last axis
       ``block//2 = 16`` bytes) and ``<name>_scales`` (one byte per block).
 
-NVFP4 (NVIDIA; DeepSeek-V4-Flash expert layout)
+NVFP4 (NVIDIA; implemented but not yet validated against a real checkpoint)
     * Block of **16** elements along the contraction axis.
     * One **e4m3 FP8** scale per block, plus a single per-tensor ``fp32``
       global scale (two-level scaling). Dequant:

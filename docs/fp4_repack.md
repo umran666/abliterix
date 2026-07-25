@@ -148,7 +148,63 @@ some BF16. Only the 4-bit part is in scope here — the FP8 tensors are
 - **Saves**: the *output* footprint (142 GB FP4 vs 568 GB BF16 merge), the
   ability to serve the abliterated model natively as FP4, and the
   `export_merged` rejection of quantized direct edits.
-- **Does not (yet) save**: the *search* footprint. Because native MXFP4 still
-  loads as BF16 in the engine (`Mxfp4Config(dequantize=True)`), the search/export
-  step keeps the historical VRAM sizing. Shrinking the search itself is the
-  frozen-FP4 + adapter path (path A) — a separate, larger piece of work.
+- **Does not save**: the *search* footprint. The engine still loads native MXFP4
+  as BF16 (`Mxfp4Config(dequantize=True)`) because the Optuna loop mutates
+  weights. See below.
+
+# Shrinking the search too: forward-time EGA
+
+`abliterix.core.frozen_experts` removes the need to mutate weights at all, so
+the search can run against the packed 4-bit model.
+
+The EGA edit is rank-1, which makes it expressible on activations. Writing out
+the matmul for both layouts:
+
+```
+gpt-oss    W[e] is (in, out), y = x @ W[e]:
+           W_new = W - s (W d) ⊗ d        ⇒  y_new = y - s (y·d) d
+
+DeepSeek   W[e] is (out, in), y = W[e] @ x:
+           W_new = W - s d ⊗ (dᵀW)        ⇒  y_new = y - s (y·d) d
+```
+
+Both collapse to the same weight-free expression: **project `d` out of the
+expert output**. Nothing is dequantised, copied, or mutated — the packed kernel
+runs as shipped.
+
+### Row-norm preservation
+
+`weight_normalization != "none"` is not a pure activation transform, but it is
+still only an elementwise rescale, on a layout-dependent side: per-**input**
+position for gpt-oss (norms along `out`), per-**output** position for DeepSeek
+(norms along `in`). `compute_norm_preserve_scales()` derives the factors from
+closed forms of the edited row norms — no edited weight is materialised — at the
+cost of one or two matvecs against the base weight per trial, which a caller can
+serve by dequantising a single layer transiently.
+
+`weight_normalization = "none"` needs no weight access at all.
+
+### The expert bias (easy to get wrong)
+
+EGA edits the weight and leaves the bias alone, so the intended output is
+`P(act@W) + bias`. A container-level hook only sees the sum and computes
+`P(act@W + bias)` — it projects the bias too, over-shooting by `s·(bias·d)·d`.
+gpt-oss has `down_proj_bias` of shape `(E, hidden)`, so this is real, not
+theoretical.
+
+Pass `bias_dot_d` (from `weighted_bias_projection(bias, d, router_scores)`) to
+`finish_output`, or give `install_frozen_ega_hook` a `bias_dot_d_fn`, and the
+hook matches the weight edit exactly.
+
+### Status
+
+The equivalence is proven in tests — for both layouts, with and without row-norm
+preservation, `forward_path(x) == x @ apply_ega_projection(W, ...)` — which is
+what lets a search on frozen weights hand its winning parameters to the bake
+above and get a checkpoint describing the same model.
+
+**Not yet wired into the engine's steering-mode dispatch**, and the container
+hook has not been validated on a real model. A fused multi-expert container also
+cannot do row-norm preservation (the factors are per expert and the hook cannot
+see per-token routing); `install_frozen_ega_hook` raises rather than
+approximating.

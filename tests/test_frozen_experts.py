@@ -18,6 +18,7 @@ from abliterix.core.frozen_experts import (
     compute_norm_preserve_scales,
     install_frozen_ega_hook,
     project_out_direction,
+    weighted_bias_projection,
 )
 from abliterix.weight_transforms import apply_ega_projection
 
@@ -351,3 +352,82 @@ def test_single_expert_norm_preserve_hook_is_allowed():
         W, d, strength=strength, axis_is_in=False, preserve_row_norm=True
     )
     assert torch.allclose(got, edited[0] @ x, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Expert bias: EGA edits the weight but not the bias, so a container-level hook
+# over-projects unless told about it. gpt-oss's down_proj_bias is (E, hidden).
+# ---------------------------------------------------------------------------
+
+
+def _moe_reference(x, W, bias, routing, edited_W=None):
+    """sum_e routing[t,e] * (x[t] @ W[e] + bias[e]) — the container's job."""
+    Wm = W if edited_W is None else edited_W
+    per_e = torch.stack([x @ Wm[e] + bias[e] for e in range(W.shape[0])], dim=1)
+    return (routing.unsqueeze(-1) * per_e).sum(dim=1)
+
+
+def test_bias_makes_naive_hook_diverge_and_correction_fixes_it():
+    """The whole point of `bias_dot_d`: without it the hook is measurably wrong."""
+    torch.manual_seed(40)
+    E, d_in, d_out, T = 4, 10, 14, 6
+    W = torch.randn(E, d_in, d_out)
+    bias = torch.randn(E, d_out) * 0.5
+    routing = torch.softmax(torch.randn(T, E), dim=-1)
+    x = torch.randn(T, d_in)
+    d = torch.randn(d_out)
+    d = d / d.norm()
+    strength = 2.0
+
+    # Ground truth: edit the WEIGHT only, bias untouched.
+    W_edit = apply_ega_projection(
+        W, d, strength=strength, axis_is_in=True, preserve_row_norm=False
+    )
+    want = _moe_reference(x, W, bias, routing, edited_W=W_edit)
+
+    y_container = _moe_reference(x, W, bias, routing)
+    plan = build_frozen_plan(
+        None, d, strength, axis_is_in=True, preserve_row_norm=False
+    )
+
+    naive = plan.finish_output(y_container)
+    corr = weighted_bias_projection(bias, d, routing)
+    fixed = plan.finish_output(y_container, bias_dot_d=corr)
+
+    naive_err = (naive - want).abs().mean().item()
+    fixed_err = (fixed - want).abs().mean().item()
+    # The bias really does break the naive hook...
+    assert naive_err > 1e-3, naive_err
+    # ...and the correction restores exactness.
+    assert fixed_err < 1e-5, (naive_err, fixed_err)
+
+
+def test_bias_correction_is_a_noop_without_bias():
+    torch.manual_seed(41)
+    E, d_in, d_out, T = 3, 8, 12, 5
+    W = torch.randn(E, d_in, d_out)
+    bias = torch.zeros(E, d_out)
+    routing = torch.softmax(torch.randn(T, E), dim=-1)
+    x = torch.randn(T, d_in)
+    d = torch.randn(d_out)
+    plan = build_frozen_plan(None, d, 1.5, axis_is_in=True, preserve_row_norm=False)
+
+    y = _moe_reference(x, W, bias, routing)
+    corr = weighted_bias_projection(bias, d, routing)
+    assert torch.allclose(corr, torch.zeros(T), atol=1e-6)
+    assert torch.allclose(
+        plan.finish_output(y), plan.finish_output(y, bias_dot_d=corr), atol=1e-6
+    )
+
+
+def test_weighted_bias_projection_matches_explicit_sum():
+    torch.manual_seed(42)
+    E, d_out, T = 5, 9, 4
+    bias = torch.randn(E, d_out)
+    routing = torch.softmax(torch.randn(T, E), dim=-1)
+    d = torch.randn(d_out)
+    got = weighted_bias_projection(bias, d, routing)
+    want = torch.stack(
+        [sum(routing[t, e] * (bias[e] @ d) for e in range(E)) for t in range(T)]
+    )
+    assert torch.allclose(got, want, atol=1e-5)

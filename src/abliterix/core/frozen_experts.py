@@ -189,14 +189,51 @@ class FrozenEgaPlan:
         return (x.to(torch.float32) * r).to(x.dtype)
 
     def finish_output(
-        self, y: Tensor, expert_index: Tensor | int | None = None
+        self,
+        y: Tensor,
+        expert_index: Tensor | int | None = None,
+        bias_dot_d: Tensor | None = None,
     ) -> Tensor:
-        """Project the direction out, then apply any output-side rescale."""
+        """Project the direction out, then apply any output-side rescale.
+
+        ``bias_dot_d`` corrects for an additive bias inside ``y``. EGA edits
+        only the weight, so the intended output is ``P(act@W) + bias`` — but a
+        hook sees ``y = act@W + bias`` and computes ``P(y) = P(act@W) + P(bias)``,
+        over-projecting the bias by ``s·(bias·d)·d``. Passing ``bias·d`` (per
+        token, from :func:`weighted_bias_projection`) adds that back, making the
+        hook exactly equal to the weight edit. Omit it only when the expert has
+        no bias, or when you deliberately want the bias projected too.
+        """
         out = project_out_direction(y, self.direction, self.strength)
+        if bias_dot_d is not None:
+            d = self.direction.to(dtype=torch.float32, device=out.device)
+            corr = bias_dot_d.to(dtype=torch.float32, device=out.device)
+            out = (out.to(torch.float32) + self.strength * corr.unsqueeze(-1) * d).to(
+                y.dtype
+            )
         if self.scales is None or self.scales_apply_to_input:
             return out
         r = _gather_expert_scales(self.scales, expert_index, out)
         return (out.to(torch.float32) * r).to(y.dtype)
+
+
+def weighted_bias_projection(
+    bias: Tensor, direction: Tensor, routing_weights: Tensor
+) -> Tensor:
+    """``B·d`` per token, where ``B = Σ_e w[token,e] · bias[e]``.
+
+    Feed the result to :meth:`FrozenEgaPlan.finish_output` as ``bias_dot_d`` to
+    make a container-level hook exactly match the weight edit on architectures
+    whose expert down-projection carries a bias (gpt-oss does: ``down_proj_bias``
+    is ``(E, hidden)``).
+
+    ``bias`` is ``(E, out)``, ``routing_weights`` is ``(tokens, E)`` — the same
+    scores the MoE block uses to combine experts. Returns ``(tokens,)``.
+    """
+    b = bias.to(torch.float32)
+    d = direction.to(dtype=torch.float32, device=b.device)
+    per_expert = b @ d  # (E,)
+    return routing_weights.to(dtype=torch.float32, device=b.device) @ per_expert
 
 
 def _gather_expert_scales(

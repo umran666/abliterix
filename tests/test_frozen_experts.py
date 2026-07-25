@@ -1,0 +1,353 @@
+"""Tests for abliterix.core.frozen_experts — forward-time EGA on frozen weights.
+
+The load-bearing property: running an expert through the forward path must give
+exactly what editing its weights would have given. If that holds, the Optuna
+search can run against packed 4-bit weights (13 GB instead of 27 GB for
+gpt-oss-20b; 160 GB instead of ~600 GB for DeepSeek-V4-Flash) and the resulting
+plan can still be baked into a checkpoint by fp4_repack describing the same
+model. Everything here is synthetic and CPU-only.
+"""
+
+import pytest
+import torch
+
+from abliterix.core.frozen_experts import (
+    FrozenEgaPlan,
+    apply_frozen_ega,
+    build_frozen_plan,
+    compute_norm_preserve_scales,
+    install_frozen_ega_hook,
+    project_out_direction,
+)
+from abliterix.weight_transforms import apply_ega_projection
+
+
+def _rand(E=3, d0=12, d1=20, seed=0):
+    torch.manual_seed(seed)
+    return torch.randn(E, d0, d1)
+
+
+# ---------------------------------------------------------------------------
+# The weight-free projection
+# ---------------------------------------------------------------------------
+
+
+def test_project_out_direction_removes_component():
+    """With a unit direction (what abliterix always supplies) strength 1 is
+    exactly the orthogonal projection."""
+    torch.manual_seed(1)
+    y = torch.randn(4, 16)
+    d = torch.randn(16)
+    d = d / d.norm()
+    out = project_out_direction(y, d, strength=1.0)
+    assert torch.allclose((out * d).sum(-1), torch.zeros(4), atol=1e-5)
+
+
+def test_project_out_direction_uses_raw_direction_scaling():
+    """The direction is NOT renormalised — it must match apply_ega_projection.
+
+    A silent renormalisation here would make the frozen path disagree with the
+    weight-edit path whenever the caller's vector is not unit length.
+    """
+    torch.manual_seed(2)
+    y = torch.randn(3, 12)
+    d = torch.randn(12)
+    got = project_out_direction(y, d, strength=0.7)
+    want = y - 0.7 * (y * d).sum(-1, keepdim=True) * d
+    assert torch.allclose(got, want, atol=1e-6)
+    # Doubling d changes the result (it would not if we renormalised).
+    assert not torch.allclose(got, project_out_direction(y, 2 * d, 0.7), atol=1e-4)
+
+
+def test_project_out_direction_zero_strength_is_identity():
+    y = torch.randn(3, 8)
+    assert torch.allclose(project_out_direction(y, torch.randn(8), 0.0), y, atol=1e-6)
+
+
+def test_project_out_direction_preserves_dtype():
+    y = torch.randn(2, 8, dtype=torch.bfloat16)
+    assert project_out_direction(y, torch.randn(8), 0.5).dtype == torch.bfloat16
+
+
+# ---------------------------------------------------------------------------
+# Equivalence WITHOUT norm preservation — the fully weight-free case
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("axis_is_in", [True, False])
+def test_forward_equals_weight_edit_no_norm_preserve(axis_is_in):
+    """y = x @ W_edited  ==  project(x @ W_base). No weights touched."""
+    E, d0, d1 = 3, 12, 20
+    W = _rand(E, d0, d1, seed=2)
+    strength = 1.7
+    hidden = d1 if axis_is_in else d0
+    d = torch.randn(hidden)
+
+    W_edit = apply_ega_projection(
+        W, d, strength=strength, axis_is_in=axis_is_in, preserve_row_norm=False
+    )
+    plan = build_frozen_plan(
+        None, d, strength, axis_is_in=axis_is_in, preserve_row_norm=False
+    )
+    assert plan.scales is None  # never read the weights
+
+    for e in range(E):
+        x = torch.randn(d0 if axis_is_in else d1)
+        want = x @ W_edit[e] if axis_is_in else W_edit[e] @ x
+        got = apply_frozen_ega(x, W, plan, expert_index=e)
+        assert torch.allclose(got, want, atol=1e-5), (axis_is_in, e)
+
+
+# ---------------------------------------------------------------------------
+# Equivalence WITH norm preservation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("axis_is_in", [True, False])
+@pytest.mark.parametrize("strength", [0.5, 1.0, 2.5])
+def test_forward_equals_weight_edit_with_norm_preserve(axis_is_in, strength):
+    E, d0, d1 = 3, 12, 20
+    W = _rand(E, d0, d1, seed=3)
+    hidden = d1 if axis_is_in else d0
+    d = torch.randn(hidden)
+
+    W_edit = apply_ega_projection(
+        W, d, strength=strength, axis_is_in=axis_is_in, preserve_row_norm=True
+    )
+    plan = build_frozen_plan(
+        W, d, strength, axis_is_in=axis_is_in, preserve_row_norm=True
+    )
+    assert plan.scales is not None and plan.scales.shape == (E, d0)
+
+    for e in range(E):
+        x = torch.randn(d0 if axis_is_in else d1)
+        want = x @ W_edit[e] if axis_is_in else W_edit[e] @ x
+        got = apply_frozen_ega(x, W, plan, expert_index=e)
+        assert torch.allclose(got, want, atol=1e-4), (axis_is_in, strength, e)
+
+
+@pytest.mark.parametrize("axis_is_in", [True, False])
+def test_norm_preserve_scales_match_explicit_row_norms(axis_is_in):
+    """The closed-form factors equal the ratio of the actual edited row norms."""
+    E, d0, d1 = 2, 10, 16
+    W = _rand(E, d0, d1, seed=4)
+    strength = 1.3
+    d = torch.randn(d1 if axis_is_in else d0)
+
+    got = compute_norm_preserve_scales(W, d, strength, axis_is_in=axis_is_in)
+
+    # Explicitly build the un-normalised edit and measure its row norms.
+    raw = apply_ega_projection(
+        W, d, strength=strength, axis_is_in=axis_is_in, preserve_row_norm=False
+    )
+    orig = torch.linalg.vector_norm(W.float(), dim=-1)
+    new = torch.linalg.vector_norm(raw, dim=-1).clamp(min=1e-8)
+    assert torch.allclose(got, orig / new, atol=1e-4)
+
+
+def test_scales_side_depends_on_layout():
+    W = _rand(seed=5)
+    d_in = torch.randn(W.shape[2])
+    d_out = torch.randn(W.shape[1])
+    assert build_frozen_plan(
+        W, d_in, 1.0, axis_is_in=True, preserve_row_norm=True
+    ).scales_apply_to_input
+    assert not build_frozen_plan(
+        W, d_out, 1.0, axis_is_in=False, preserve_row_norm=True
+    ).scales_apply_to_input
+
+
+def test_build_plan_rejects_missing_weight_when_norms_requested():
+    with pytest.raises(ValueError, match="needs the base weight"):
+        build_frozen_plan(
+            None, torch.randn(8), 1.0, axis_is_in=True, preserve_row_norm=True
+        )
+
+
+def test_compute_scales_rejects_direction_mismatch():
+    W = _rand(seed=6)
+    with pytest.raises(ValueError, match="direction len"):
+        compute_norm_preserve_scales(W, torch.randn(7), 1.0, axis_is_in=True)
+    with pytest.raises(ValueError, match="direction len"):
+        compute_norm_preserve_scales(W, torch.randn(7), 1.0, axis_is_in=False)
+
+
+# ---------------------------------------------------------------------------
+# Batched activations + per-token expert routing
+# ---------------------------------------------------------------------------
+
+
+def test_batched_tokens_match_per_token_application():
+    """A (tokens, d) activation is handled the same as looping over tokens."""
+    E, d0, d1 = 2, 8, 12
+    W = _rand(E, d0, d1, seed=7)
+    d = torch.randn(d1)
+    plan = build_frozen_plan(W, d, 1.1, axis_is_in=True, preserve_row_norm=True)
+    x = torch.randn(5, d0)
+    batched = apply_frozen_ega(x, W, plan, expert_index=1)
+    for t in range(x.shape[0]):
+        one = apply_frozen_ega(x[t], W, plan, expert_index=1)
+        assert torch.allclose(batched[t], one, atol=1e-5)
+
+
+def test_per_token_expert_index_selects_matching_scales():
+    """Token-major routing: each token gets its own expert's rescale row."""
+    E, d0, d1 = 3, 6, 10
+    W = _rand(E, d0, d1, seed=8)
+    d = torch.randn(d1)
+    plan = build_frozen_plan(W, d, 0.9, axis_is_in=True, preserve_row_norm=True)
+
+    x = torch.randn(3, d0)
+    idx = torch.tensor([2, 0, 1])
+    scaled = plan.prepare_input(x, idx)
+    for t, e in enumerate(idx.tolist()):
+        assert torch.allclose(scaled[t], x[t] * plan.scales[e], atol=1e-5)
+
+
+def test_gather_requires_index_when_multiple_experts():
+    W = _rand(seed=9)
+    plan = build_frozen_plan(
+        W, torch.randn(W.shape[2]), 1.0, axis_is_in=True, preserve_row_norm=True
+    )
+    with pytest.raises(ValueError, match="expert_index required"):
+        plan.prepare_input(torch.randn(W.shape[1]), None)
+
+
+# ---------------------------------------------------------------------------
+# The property that makes search-on-frozen-weights safe
+# ---------------------------------------------------------------------------
+
+
+def test_frozen_search_then_bake_describe_the_same_model():
+    """Forward-hook search and a weight bake from the same plan agree.
+
+    This is the contract path A relies on: tune strengths against frozen packed
+    weights, then hand the winning parameters to fp4_repack, and the baked
+    checkpoint behaves as the search measured.
+    """
+    E, d0, d1 = 4, 16, 24
+    W = _rand(E, d0, d1, seed=10)
+    d = torch.randn(d1)
+    for strength in (0.4, 1.0, 3.0):
+        plan = build_frozen_plan(
+            W, d, strength, axis_is_in=True, preserve_row_norm=True
+        )
+        baked = apply_ega_projection(
+            W, d, strength=strength, axis_is_in=True, preserve_row_norm=True
+        )
+        x = torch.randn(7, d0)
+        via_hook = apply_frozen_ega(x, W, plan, expert_index=2)
+        via_bake = x @ baked[2]
+        rel = (via_hook - via_bake).abs().max() / via_bake.abs().max().clamp(min=1e-9)
+        assert rel < 1e-4, (strength, float(rel))
+
+
+def test_plan_is_serialisable_state():
+    """A plan is plain tensors/floats — safe to ship to a worker or store."""
+    W = _rand(seed=11)
+    plan = build_frozen_plan(
+        W, torch.randn(W.shape[2]), 1.5, axis_is_in=True, preserve_row_norm=True
+    )
+    assert isinstance(plan, FrozenEgaPlan)
+    assert plan.direction.dtype == torch.float32
+    assert isinstance(plan.strength, float)
+    assert plan.scales.dtype == torch.float32
+
+
+# ---------------------------------------------------------------------------
+# Hook installation against a synthetic MoE container
+# ---------------------------------------------------------------------------
+
+
+class _FakeExperts(torch.nn.Module):
+    """Stands in for a packed expert container: weights are never editable."""
+
+    def __init__(self, W):
+        super().__init__()
+        self.register_buffer("W", W)  # (E, in, out) — gpt-oss orientation
+
+    def forward(self, x, expert_index=0):
+        return x @ self.W[expert_index]
+
+
+def test_hook_reproduces_weight_edit_without_norm_preserve():
+    """A hooked frozen module == the same module with edited weights."""
+    torch.manual_seed(20)
+    E, d_in, d_out = 3, 10, 14
+    W = torch.randn(E, d_in, d_out)
+    d = torch.randn(d_out)
+    strength = 1.6
+
+    frozen = _FakeExperts(W.clone())
+    plan = build_frozen_plan(
+        None, d, strength, axis_is_in=True, preserve_row_norm=False
+    )
+    handles = install_frozen_ega_hook(frozen, plan)
+
+    edited = _FakeExperts(
+        apply_ega_projection(
+            W, d, strength=strength, axis_is_in=True, preserve_row_norm=False
+        )
+    )
+
+    x = torch.randn(6, d_in)
+    for e in range(E):
+        assert torch.allclose(frozen(x, e), edited(x, e), atol=1e-4)
+
+    # The frozen module's weights were never modified.
+    assert torch.equal(frozen.W, W)
+
+    for h in handles:
+        h.remove()
+    assert torch.allclose(frozen(x, 0), x @ W[0], atol=1e-5)  # back to baseline
+
+
+def test_hook_rejects_fused_norm_preserve_instead_of_guessing():
+    """Multi-expert row-norm preservation cannot be done at the container level."""
+    W = _rand(E=4, seed=21)
+    plan = build_frozen_plan(
+        W, torch.randn(W.shape[2]), 1.0, axis_is_in=True, preserve_row_norm=True
+    )
+    with pytest.raises(NotImplementedError, match="per-token routing"):
+        install_frozen_ega_hook(_FakeExperts(W), plan)
+
+
+def test_hook_handles_tuple_outputs():
+    class _TupleExperts(torch.nn.Module):
+        def __init__(self, W):
+            super().__init__()
+            self.register_buffer("W", W)
+
+        def forward(self, x):
+            return x @ self.W, "aux"
+
+    torch.manual_seed(22)
+    W = torch.randn(8, 12)
+    d = torch.randn(12)
+    mod = _TupleExperts(W)
+    install_frozen_ega_hook(
+        mod, build_frozen_plan(None, d, 1.0, axis_is_in=True, preserve_row_norm=False)
+    )
+    x = torch.randn(3, 8)
+    y, aux = mod(x)
+    assert aux == "aux"
+    assert torch.allclose(y, project_out_direction(x @ W, d, 1.0), atol=1e-5)
+
+
+def test_single_expert_norm_preserve_hook_is_allowed():
+    """Per-expert modules (DeepSeek layout) can preserve norms via the hook."""
+    torch.manual_seed(23)
+    d_out, d_in = 10, 16
+    W = torch.randn(1, d_out, d_in)  # single expert, (out, in)
+    d = torch.randn(d_out)
+    strength = 1.2
+
+    plan = build_frozen_plan(W, d, strength, axis_is_in=False, preserve_row_norm=True)
+    assert plan.scales.shape == (1, d_out)
+
+    x = torch.randn(d_in)
+    got = apply_frozen_ega(x, W, plan, expert_index=0)
+    edited = apply_ega_projection(
+        W, d, strength=strength, axis_is_in=False, preserve_row_norm=True
+    )
+    assert torch.allclose(got, edited[0] @ x, atol=1e-4)

@@ -431,3 +431,52 @@ def test_weighted_bias_projection_matches_explicit_sum():
         [sum(routing[t, e] * (bias[e] @ d) for e in range(E)) for t in range(T)]
     )
     assert torch.allclose(got, want, atol=1e-5)
+
+
+def test_installed_hook_applies_bias_correction_from_forward_args():
+    """The installer wires bias correction through, recomputed per forward.
+
+    Mirrors gpt-oss: a fused container that takes router scores as an argument
+    and adds a per-expert down_proj bias internally.
+    """
+    torch.manual_seed(43)
+    E, d_in, d_out, T = 4, 9, 13, 7
+    W = torch.randn(E, d_in, d_out)
+    bias = torch.randn(E, d_out) * 0.4
+    d = torch.randn(d_out)
+    d = d / d.norm()
+    strength = 2.5
+
+    class _Container(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("W", W)
+            self.register_buffer("down_proj_bias", bias)
+
+        def forward(self, x, routing):
+            return _moe_reference(x, self.W, self.down_proj_bias, routing)
+
+    mod = _Container()
+    plan = build_frozen_plan(
+        None, d, strength, axis_is_in=True, preserve_row_norm=False
+    )
+    install_frozen_ega_hook(
+        mod,
+        plan,
+        bias_dot_d_fn=lambda args: weighted_bias_projection(bias, d, args[1]),
+    )
+
+    x = torch.randn(T, d_in)
+    routing = torch.softmax(torch.randn(T, E), dim=-1)
+    got = mod(x, routing)
+
+    W_edit = apply_ega_projection(
+        W, d, strength=strength, axis_is_in=True, preserve_row_norm=False
+    )
+    want = _moe_reference(x, W, bias, routing, edited_W=W_edit)
+    assert torch.allclose(got, want, atol=1e-4)
+
+    # A second call with different routing must recompute the correction.
+    routing2 = torch.softmax(torch.randn(T, E), dim=-1)
+    want2 = _moe_reference(x, W, bias, routing2, edited_W=W_edit)
+    assert torch.allclose(mod(x, routing2), want2, atol=1e-4)

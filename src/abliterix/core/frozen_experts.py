@@ -293,12 +293,20 @@ def build_frozen_plan(
 # ---------------------------------------------------------------------------
 
 
-def install_frozen_ega_hook(module, plan: FrozenEgaPlan):
-    """Attach ``plan`` to an MoE expert container's forward, returning a handle.
+def install_frozen_ega_hook(module, plan: FrozenEgaPlan, *, bias_dot_d_fn=None):
+    """Attach ``plan`` to an MoE expert container's forward, returning handles.
 
     The hook post-processes whatever the container returns, so it works with a
     packed 4-bit expert kernel unchanged — that is the point: the weights are
     never dequantised, never copied, never mutated.
+
+    ``bias_dot_d_fn`` is an optional ``callable(args) -> Tensor`` receiving the
+    container's forward args and returning the per-token ``bias·d`` correction
+    (see :func:`weighted_bias_projection`). **Supply it whenever the expert
+    down-projection has a bias** — gpt-oss's does — or the hook will also
+    project the bias, which the weight edit does not, and the two paths will
+    disagree. Extracting the router scores from ``args`` is architecture-
+    specific, which is why it is a caller-supplied hook rather than a guess.
 
     Requirements the caller owns:
 
@@ -334,10 +342,18 @@ def install_frozen_ega_hook(module, plan: FrozenEgaPlan):
 
         handles.append(module.register_forward_pre_hook(_pre))
 
-    def _post(_mod, _args, output):
+    def _post(_mod, args, output):
+        # Recomputed per call: the correction is per token, so it depends on
+        # this forward's routing, not on anything cached at install time.
+        corr = bias_dot_d_fn(args) if bias_dot_d_fn is not None else None
+        y = output[0] if isinstance(output, tuple) else output
+        flat = y.reshape(-1, y.shape[-1]) if corr is not None else y
+        edited = plan.finish_output(flat, None, bias_dot_d=corr)
+        if corr is not None:
+            edited = edited.reshape(y.shape)
         if isinstance(output, tuple):
-            return (plan.finish_output(output[0], None),) + tuple(output[1:])
-        return plan.finish_output(output, None)
+            return (edited,) + tuple(output[1:])
+        return edited
 
     handles.append(module.register_forward_hook(_post))
     return handles

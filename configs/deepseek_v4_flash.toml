@@ -36,6 +36,15 @@ non_interactive = true
 #     standalone 4-bit checkpoint with `abliterix-abliterate-fp4`. Only the
 #     edited tensors are dequant->project->repacked; the rest is copied
 #     through, so the OUTPUT stays ~142 GB instead of a 568 GB BF16 merge.
+#     NOTE (fixed 2026-07): abliterix-dequant-fp8 used to CORRUPT this model.
+#     It looked for scale siblings named weight_scale_inv/weight_scale, while
+#     DeepSeek names them `.scale`, so it found none and fell back to a bare
+#     dtype cast — dropping every 128x128 block scale. Measured on
+#     layers.0.attn.wo_b: absmean 64.9 instead of 0.019 (3361x off). `.scale`
+#     is now recognised and an unscaled FP8 tensor raises instead of casting.
+#     The FP4 bake also edits the FP8 attention / shared experts directly now,
+#     so a full DSV4 abliteration no longer needs the BF16 detour at all.
+#
 #     STATUS for THIS model: SUPPORTED and verified against real weights —
 #     layout auto-detected, w2 keys resolve across all 43 layers, round-trip
 #     guard passes on untouched bytes, and an EGA edit repacks with ~2.7%

@@ -97,11 +97,37 @@ def test_apply_tensor_edit_moves_direction_to_weight_device():
 
 
 def test_apply_tensor_edit_rejects_wrong_rank():
+    # 4-D is not an expert weight under any layout.
     with pytest.raises(ValueError):
         rp.apply_tensor_edit(
-            torch.randn(8, 8),
+            torch.randn(2, 4, 8, 8),
             rp.TensorEdit("x", "ega", torch.randn(8), 1.0, True, hidden_dim=8),
         )
+    # A direct edit still requires 2-D.
+    with pytest.raises(ValueError):
+        rp.apply_tensor_edit(
+            torch.randn(4, 8, 8),
+            rp.TensorEdit("x", "direct", torch.randn(8), 1.0, True),
+        )
+
+
+def test_apply_tensor_edit_ega_on_single_expert_2d_matches_fused():
+    """A per-expert 2-D EGA edit == the same expert inside a fused 3-D edit.
+
+    DeepSeek-V4 stores one 2-D tensor per expert while gpt-oss fuses them; the
+    abliteration must not depend on that grouping.
+    """
+    torch.manual_seed(30)
+    hidden, inter, E = 8, 32, 3
+    fused = torch.randn(E, hidden, inter)
+    d = torch.randn(hidden)
+    edit = rp.TensorEdit("x", "ega", d, 1.4, True, hidden_dim=hidden, transposed=False)
+
+    fused_out = rp.apply_tensor_edit(fused, edit)
+    for e in range(E):
+        per_expert_out = rp.apply_tensor_edit(fused[e], edit)
+        assert per_expert_out.shape == (hidden, inter)
+        assert torch.allclose(per_expert_out, fused_out[e], atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -548,3 +574,172 @@ def test_cli_missing_inputs_return_error_codes(tmp_path):
         [str(tmp_path / "nope"), str(tmp_path / "p.pt"), str(tmp_path / "o")]
     )
     assert rc == 2
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4-Flash layout: `.weight`/`.scale`, flat 2-D I8, F8_E8M0 scales,
+# one tensor per expert. Element format is the same MXFP4 math as gpt-oss;
+# only the on-disk packaging differs.
+# ---------------------------------------------------------------------------
+
+_HAS_E8M0 = hasattr(torch, "float8_e8m0fnu")
+
+
+def _pack_deepseek_style(w, block=32):
+    """Emit (flat I8 weight, F8_E8M0 scale) the way DeepSeek stores experts."""
+    blocks, scales = f4.quantize_to_mxfp4(w, block)  # (out, nb, bytes), (out, nb)
+    flat = blocks.reshape(w.shape[0], -1).view(torch.int8)  # bit-cast, not convert
+    sc = scales.view(torch.float8_e8m0fnu) if _HAS_E8M0 else scales
+    return flat, sc
+
+
+def test_deepseek_layout_key_resolution():
+    present = {
+        "layers.0.ffn.experts.3.w2.weight",
+        "layers.0.ffn.experts.3.w2.scale",
+        "layers.0.ffn.gate.weight",
+    }
+    ks = rp.resolve_fp4_keys(
+        "layers.0.ffn.experts.3.w2",
+        present,
+        f4.Fp4Format("mxfp4", 32),
+        rp.DEEPSEEK_V4_LAYOUT,
+    )
+    assert ks == rp._Fp4KeySet(
+        "layers.0.ffn.experts.3.w2.weight", "layers.0.ffn.experts.3.w2.scale"
+    )
+    # A BF16 router is not FP4-encoded.
+    assert (
+        rp.resolve_fp4_keys(
+            "layers.0.ffn.gate",
+            present,
+            f4.Fp4Format("mxfp4", 32),
+            rp.DEEPSEEK_V4_LAYOUT,
+        )
+        is None
+    )
+
+
+def test_detect_layout_distinguishes_producers():
+    fmt = f4.Fp4Format("mxfp4", 32)
+    assert rp.detect_layout({"m.down_proj_blocks", "m.down_proj_scales"}, fmt) is (
+        rp.GPT_OSS_LAYOUT
+    )
+    assert rp.detect_layout(
+        {"l.0.ffn.experts.0.w2.weight", "l.0.ffn.experts.0.w2.scale"}, fmt
+    ) is (rp.DEEPSEEK_V4_LAYOUT)
+    assert rp.detect_layout({"only.bf16.weight"}, fmt) is None
+
+
+@pytest.mark.skipif(not _HAS_E8M0, reason="torch lacks float8_e8m0fnu")
+def test_deepseek_flat_packing_roundtrips_through_repack():
+    """Flat 2-D I8 + E8M0 scale survives dequant -> requant unchanged."""
+    torch.manual_seed(31)
+    out_f, in_f = 16, 128
+    w = torch.randn(out_f, in_f) * 0.05
+    flat, sc = _pack_deepseek_style(w)
+    assert flat.dtype == torch.int8 and flat.shape == (out_f, in_f // 2)
+    assert sc.dtype == torch.float8_e8m0fnu and sc.shape == (out_f, in_f // 32)
+
+    keys = rp._Fp4KeySet("e.w2.weight", "e.w2.scale")
+    src = {keys.blocks: flat, keys.scales: sc}
+    fmt = f4.Fp4Format("mxfp4", 32)
+
+    W = rp._dequant_fp4_tensor(src, keys, fmt)
+    assert W.shape == (out_f, in_f)  # flat -> blocked -> full, no transpose
+
+    re = rp._requant_fp4_tensor(W, keys, fmt, src)
+    # Stored shape and byte dtypes are preserved exactly.
+    assert re[keys.blocks].shape == flat.shape and re[keys.blocks].dtype == torch.int8
+    assert re[keys.scales].dtype == torch.float8_e8m0fnu
+    W2 = rp._dequant_fp4_tensor({**src, **re}, keys, fmt)
+    assert torch.equal(W, W2)
+    rp._assert_layout_roundtrip(src, keys, fmt, name="e.w2")
+
+
+@pytest.mark.skipif(not _HAS_E8M0, reason="torch lacks float8_e8m0fnu")
+def test_int8_storage_is_bitcast_not_clamped():
+    """Packed bytes >127 must survive int8 storage (a .to() would clamp them)."""
+    torch.manual_seed(32)
+    # Strongly negative values set the high nibble's sign bit -> bytes >= 0x80.
+    w = -torch.rand(4, 64) * 0.1 - 0.05
+    flat, sc = _pack_deepseek_style(w)
+    keys = rp._Fp4KeySet("w.weight", "w.scale")
+    src = {keys.blocks: flat, keys.scales: sc}
+    fmt = f4.Fp4Format("mxfp4", 32)
+    W = rp._dequant_fp4_tensor(src, keys, fmt)
+    assert (W < 0).any()
+    re = rp._requant_fp4_tensor(W, keys, fmt, src)
+    # If the cast clamped, the round-tripped bytes would differ in the high bit.
+    assert torch.equal(
+        re[keys.blocks].view(torch.uint8), flat.view(torch.uint8)
+    ) or torch.equal(rp._dequant_fp4_tensor({**src, **re}, keys, fmt), W)
+
+
+@pytest.mark.skipif(not _HAS_E8M0, reason="torch lacks float8_e8m0fnu")
+def test_deepseek_end_to_end_bake(tmp_path):
+    """Full streaming bake over a synthetic DeepSeek-shaped checkpoint."""
+    src = tmp_path / "dsv4"
+    dst = tmp_path / "dsv4_abl"
+    src.mkdir()
+    torch.manual_seed(33)
+    hidden, inter, n_exp, n_layers = 16, 64, 3, 2
+
+    tensors, originals = {}, {}
+    for L in range(n_layers):
+        for N in range(n_exp):
+            w2 = torch.randn(hidden, inter) * 0.05  # (out=hidden, in=inter)
+            flat, sc = _pack_deepseek_style(w2)
+            base = f"layers.{L}.ffn.experts.{N}.w2"
+            tensors[base + ".weight"], tensors[base + ".scale"] = flat, sc
+            originals[base] = (flat, sc)
+        tensors[f"layers.{L}.ffn.gate.weight"] = torch.randn(n_exp, hidden).to(
+            torch.bfloat16
+        )
+    save_file(tensors, str(src / "model.safetensors"), metadata={"format": "pt"})
+    (src / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v4",
+                "quantization_config": {"quant_method": "mxfp4"},
+            }
+        )
+    )
+
+    profiles = {"mlp.down_proj": SteeringProfile(3.0, 0.0, 3.0, 100.0)}
+    svs = torch.randn(n_layers + 1, hidden)
+    edits = rp.build_per_expert_ega_plan(
+        svs, profiles, n_layers=n_layers, n_experts=n_exp, hidden_dim=hidden
+    )
+    assert len(edits) == n_layers * n_exp
+
+    stats = rp.abliterate_fp4_to_disk(src, dst, edits, use_cuda=False, verbose=False)
+    assert stats.fp4_edited == n_layers * n_exp
+    assert not stats.skipped_edits
+    assert stats.copied == n_layers  # the BF16 routers
+
+    from safetensors import safe_open
+
+    with safe_open(dst / "model.safetensors", framework="pt") as f:
+        out = {k: f.get_tensor(k) for k in f.keys()}
+
+    # Stored dtype/shape preserved, and the edit actually landed.
+    base = "layers.0.ffn.experts.0.w2"
+    assert out[base + ".weight"].dtype == torch.int8
+    assert out[base + ".weight"].shape == originals[base][0].shape
+    assert out[base + ".scale"].dtype == torch.float8_e8m0fnu
+
+    keys = rp._Fp4KeySet(base + ".weight", base + ".scale")
+    fmt = f4.Fp4Format("mxfp4", 32)
+    W_orig = rp._dequant_fp4_tensor(
+        {keys.blocks: originals[base][0], keys.scales: originals[base][1]}, keys, fmt
+    )
+    W_baked = rp._dequant_fp4_tensor(out, keys, fmt)
+    expected = rp.apply_tensor_edit(W_orig, edits[0])
+    rel = (W_baked - expected).abs().mean() / expected.abs().mean()
+    assert rel < 0.2, f"baked tensor diverges from the edit: {rel}"
+    assert not torch.allclose(W_baked, W_orig, atol=1e-3)  # not a no-op
+    # Router copied through untouched.
+    assert torch.equal(
+        out["layers.0.ffn.gate.weight"], tensors["layers.0.ffn.gate.weight"]
+    )

@@ -36,13 +36,15 @@ non_interactive = true
 #     standalone 4-bit checkpoint with `abliterix-abliterate-fp4`. Only the
 #     edited tensors are dequant->project->repacked; the rest is copied
 #     through, so the OUTPUT stays ~142 GB instead of a 568 GB BF16 merge.
-#     STATUS for THIS model: the element format is verified (fp4_utils decodes
-#     these experts correctly, round-trip value-identical on real weights), but
-#     the on-disk *layout adapter* is not written yet — `resolve_fp4_keys`
-#     expects gpt-oss's `_blocks`/`_scales` 4-D layout, while DeepSeek uses
-#     `.weight`/`.scale` with a flat 2-D weight and per-expert tensors. Until
-#     that adapter lands, use the BF16 route here; the FP4 route is validated
-#     end to end on gpt-oss-20b (refusals 24/24 -> 0/24, KL 0.134).
+#     STATUS for THIS model: SUPPORTED and verified against real weights —
+#     layout auto-detected, w2 keys resolve across all 43 layers, round-trip
+#     guard passes on untouched bytes, and an EGA edit repacks with ~2.7%
+#     requant error preserving the stored int8/e8m0 dtypes. Build the plan
+#     with `fp4_repack.build_per_expert_ega_plan(n_layers=43, n_experts=256,
+#     hidden_dim=4096)` — 11008 per-expert edits on `...experts.N.w2`.
+#     NOTE: only the 4-bit routed experts are repacked. Attention and shared
+#     experts are block-wise FP8 in this model, so `attn.wo_b` is NOT edited
+#     by the FP4 path; EGA on the experts is the mechanism here.
 #   The old "packed FP4 cannot be written in place" limitation
 #   (vllm_live_suppression_dead_end.md) referred to *live* in-VRAM editing
 #   under vLLM; the offline repack sidesteps it by rebuilding the checkpoint.

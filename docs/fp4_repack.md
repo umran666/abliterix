@@ -107,20 +107,36 @@ reference dequant ends with a `transpose(1, 2)`, so the weight the model sees is
 `(E, K, rows)`; `fp4_repack` rotates to that orientation before editing and back
 before writing (see `_packed_moe_is_transposed`).
 
-**DeepSeek-V4-Flash (element format verified, layout adapter NOT yet written):**
-its routed experts are **MXFP4-compatible** — measured on the real checkpoint:
-`layers.L.ffn.experts.N.w1.weight` is `I8 [2048, 2048]` (4096 nibbles/row) with
-`.scale` `F8_E8M0 [2048, 128]`, i.e. **32 elements per block, E2M1 elements,
-power-of-two E8M0 scales** — the same math `fp4_utils` already decodes
-bit-exactly. (The model is a three-way hybrid: routed experts 4-bit, shared
-experts + attention block-wise FP8 e4m3 128×128, plus some BF16.)
+**DeepSeek-V4-Flash (supported):** its routed experts are **MXFP4-format** —
+measured on the real checkpoint, `layers.L.ffn.experts.N.w2.weight` is
+`I8 [4096, 1024]` (2048 nibbles/row) with `.scale` `F8_E8M0 [4096, 64]`, i.e.
+**32 elements per block, E2M1 elements, power-of-two E8M0 scales** — the same
+math `fp4_utils` decodes bit-exactly, just packaged differently:
+`.weight`/`.scale` instead of `_blocks`/`_scales`, a flat 2-D weight instead of
+4-D, and one tensor per expert instead of a fused 3-D parameter. `Fp4Layout`
+declares those differences; `apply_tensor_edit` gives a 2-D single-expert weight
+a singleton expert axis so both producers run the identical projection kernel.
 
-What is missing is purely a *layout adapter*, not new math:
-`resolve_fp4_keys` looks for `_blocks`/`_scales`, while DeepSeek uses
-`.weight`/`.scale`; the weight is flat 2-D `[out, in/2]` rather than 4-D and
-needs a reshape to `[out, n_blocks, bytes]`; the scale is `F8_E8M0` (viewable as
-`uint8`); and experts are separate per-index tensors rather than one fused 3-D
-parameter, so EGA would loop per expert instead of vectorising.
+Because 43 × 256 = 11008 per-expert edits are not hand-writable (and need no
+loaded model to enumerate), use `build_per_expert_ega_plan`:
+
+```python
+plan = build_per_expert_ega_plan(
+    steering_vectors, profiles,
+    n_layers=43, n_experts=256, hidden_dim=4096,
+)   # -> layers.{L}.ffn.experts.{N}.w2
+```
+
+The model is a **three-way hybrid**: routed experts 4-bit (141.7 GB, 88.8% of
+the checkpoint), shared experts + attention block-wise FP8 e4m3 128×128, plus
+some BF16. Only the 4-bit part is in scope here — the FP8 tensors are
+`fp8_utils` territory, so `attn.wo_b` is *not* edited by this path.
+
+> One packaging detail worth knowing if you add another producer: DeepSeek
+> stores packed nibbles as **signed `int8`** and scales as `float8_e8m0fnu`.
+> These are byte payloads, not numbers — `.to(torch.int8)` would clamp every
+> packed byte above 127 (any pair whose high nibble is negative) to 127. The
+> repack path bit-casts (`_store_as`) rather than converting.
 
 > Older notes in this repo described DeepSeek-V4's experts as "NVFP4". That is a
 > mislabel: `e2m1 + ue8m0 + block 32` is MXFP4. NVFP4 (block 16, e4m3 scale,
@@ -132,7 +148,87 @@ parameter, so EGA would loop per expert instead of vectorising.
 - **Saves**: the *output* footprint (142 GB FP4 vs 568 GB BF16 merge), the
   ability to serve the abliterated model natively as FP4, and the
   `export_merged` rejection of quantized direct edits.
-- **Does not (yet) save**: the *search* footprint. Because native MXFP4 still
-  loads as BF16 in the engine (`Mxfp4Config(dequantize=True)`), the search/export
-  step keeps the historical VRAM sizing. Shrinking the search itself is the
-  frozen-FP4 + adapter path (path A) — a separate, larger piece of work.
+- **Does not save**: the *search* footprint. The engine still loads native MXFP4
+  as BF16 (`Mxfp4Config(dequantize=True)`) because the Optuna loop mutates
+  weights. See below.
+
+# Shrinking the search too: forward-time EGA
+
+`abliterix.core.frozen_experts` removes the need to mutate weights at all, so
+the search can run against the packed 4-bit model.
+
+The EGA edit is rank-1, which makes it expressible on activations. Writing out
+the matmul for both layouts:
+
+```
+gpt-oss    W[e] is (in, out), y = x @ W[e]:
+           W_new = W - s (W d) ⊗ d        ⇒  y_new = y - s (y·d) d
+
+DeepSeek   W[e] is (out, in), y = W[e] @ x:
+           W_new = W - s d ⊗ (dᵀW)        ⇒  y_new = y - s (y·d) d
+```
+
+Both collapse to the same weight-free expression: **project `d` out of the
+expert output**. Nothing is dequantised, copied, or mutated — the packed kernel
+runs as shipped.
+
+### Row-norm preservation
+
+`weight_normalization != "none"` is not a pure activation transform, but it is
+still only an elementwise rescale, on a layout-dependent side: per-**input**
+position for gpt-oss (norms along `out`), per-**output** position for DeepSeek
+(norms along `in`). `compute_norm_preserve_scales()` derives the factors from
+closed forms of the edited row norms — no edited weight is materialised — at the
+cost of one or two matvecs against the base weight per trial, which a caller can
+serve by dequantising a single layer transiently.
+
+`weight_normalization = "none"` needs no weight access at all.
+
+### The expert bias (easy to get wrong)
+
+EGA edits the weight and leaves the bias alone, so the intended output is
+`P(act@W) + bias`. A container-level hook only sees the sum and computes
+`P(act@W + bias)` — it projects the bias too, over-shooting by `s·(bias·d)·d`.
+gpt-oss has `down_proj_bias` of shape `(E, hidden)`, so this is real, not
+theoretical.
+
+Pass `bias_dot_d` (from `weighted_bias_projection(bias, d, router_scores)`) to
+`finish_output`, or give `install_frozen_ega_hook` a `bias_dot_d_fn`, and the
+hook matches the weight edit exactly.
+
+### Using it
+
+```toml
+[steering]
+steering_mode = "direct"
+frozen_experts = true
+weight_normalization = "none"   # required: see below
+```
+
+The engine then skips `Mxfp4Config(dequantize=True)`, so the experts stay packed,
+and EGA dispatches to hooks instead of writing the fused weight. Handles land in
+`engine._angular_hooks`, so `restore_baseline` already removes them between
+trials. Export the winning plan with `--emit-fp4-plan` and bake it with
+`abliterix-abliterate-fp4`.
+
+Row-norm preservation is **rejected by config validation** in this mode: the
+factors are per expert, and a container-level hook cannot see which expert a
+token was routed to.
+
+### Validation (gpt-oss-20b, RTX 5090)
+
+Equivalence is proven in CPU tests for both layouts, with and without row-norm
+preservation — `forward_path(x) == x @ apply_ega_projection(W, ...)` — and
+measured on the real model at layer 12, strength 4.0:
+
+| | |
+|---|---|
+| kernel-noise floor (neither path edited) | 0.0058 |
+| naive hook vs weight edit | 0.0230 — diverges |
+| **bias-corrected hook vs weight edit** | **0.0063 — within the floor** |
+| VRAM, whole model frozen | **13.77 GB** (vs ~30 GB dequantised) |
+| hook overhead | 0.01 GB |
+
+End to end through the engine dispatch: experts stayed `Mxfp4GptOssExperts`,
+48 handles installed across 24 layers, generation changed under the hooks and
+returned exactly to baseline once they were removed.

@@ -639,6 +639,26 @@ class SteeringConfig(BaseModel):
         ),
     )
 
+    frozen_experts: bool = Field(
+        default=False,
+        description=(
+            "Apply Expert-Granular Abliteration at FORWARD time instead of "
+            "mutating fused expert weights, so a natively-quantised MoE can stay "
+            "packed during the search.  The EGA projection is rank-1, so it is "
+            "algebraically identical to projecting the refusal direction out of "
+            "the expert output — no dequantisation, no writable parameter.  "
+            "gpt-oss-20b then holds the whole model in ~13.8 GB instead of the "
+            "~30 GB its BF16 dequant needs.\n"
+            "Requires steering_mode='direct' on a MoE model.  Row-norm "
+            "preservation is not available across a fused multi-expert "
+            "container (the per-expert factors need per-token routing a "
+            "container hook cannot see), so pair this with "
+            "weight_normalization='none'.  Export the resulting plan and bake "
+            "it with `abliterix-abliterate-fp4`; see "
+            "abliterix.core.frozen_experts."
+        ),
+    )
+
     discriminative_layer_selection: bool = Field(
         default=False,
         description=(
@@ -1954,6 +1974,28 @@ class AbliterixConfig(BaseSettings):
                     "QR subspace projection only. A non-standard or searched "
                     "direct_transform would be ignored; use direct_transform="
                     "'standard' or steering_mode='lora'."
+                )
+
+        # Forward-time EGA replaces the weight mutation, so it only makes sense
+        # in direct mode, and its row-norm factors are per expert — which a
+        # fused-container hook cannot apply, since it never sees which expert a
+        # token was routed to. Reject both up front rather than surprising the
+        # user mid-search.
+        if self.steering.frozen_experts:
+            if self.steering.steering_mode != SteeringMode.DIRECT:
+                raise ValueError(
+                    "steering.frozen_experts applies the EGA edit at forward "
+                    "time in place of the direct-mode weight edit, so it "
+                    f"requires steering_mode='direct' (got "
+                    f"{self.steering.steering_mode.value!r})."
+                )
+            if self.steering.weight_normalization != WeightNorm.NONE:
+                raise ValueError(
+                    "steering.frozen_experts cannot preserve row norms across a "
+                    "fused multi-expert container: the rescale factors are per "
+                    "expert and a container-level hook cannot see per-token "
+                    "routing. Set weight_normalization='none', or drop "
+                    "frozen_experts to edit weights directly."
                 )
 
         # Direct / EGA steering edits base weights in place, which requires

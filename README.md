@@ -169,7 +169,7 @@ Abliterix auto-detects available accelerators (CUDA, XPU, MLU, MUSA, SDAA, NPU, 
 For large models:
 - **4-bit quantization**: `--model.quant-method bnb_4bit` cuts VRAM by ~4x (LoRA mode; the quantised base stays frozen and the ablation rides in a BF16 adapter)
 - **8-bit quantization**: `--model.quant-method bnb_8bit` — higher quality than 4-bit, ~2x VRAM reduction with CPU offload
-- **Native FP4 models** (gpt-oss MXFP4): abliterate and re-pack **without a BF16 blow-up** via `abliterix-abliterate-fp4` — the output stays 4-bit and serves natively on vLLM. Validated end to end on gpt-oss-20b. DeepSeek-V4-Flash's routed experts use the same MXFP4 element format (verified) but a different on-disk layout, so they still need the BF16 route until the adapter lands. See [docs/fp4_repack.md](docs/fp4_repack.md).
+- **Native FP4 models** (gpt-oss MXFP4, DeepSeek-V4-Flash routed experts): abliterate and re-pack **without a BF16 blow-up** via `abliterix-abliterate-fp4` — the output stays 4-bit and serves natively on vLLM. Validated end to end on gpt-oss-20b. `core.frozen_experts` additionally lets the *search* run against packed 4-bit weights by applying the rank-1 EGA edit at forward time instead of mutating weights. See [docs/fp4_repack.md](docs/fp4_repack.md).
 - **Per-device memory limits**: set `[model] max_memory = {"0": "20GB", "cpu": "64GB"}` in your config
 - **Non-interactive mode**: `--non-interactive` for fully automated batch runs
 

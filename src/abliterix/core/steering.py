@@ -339,14 +339,26 @@ def apply_steering(
         # critical for MoE models where refusal signal is distributed across
         # all experts (TrevorS EGA method: 3/100 vs 29/100 without).
         if engine.has_expert_routing():
-            _apply_ega_steering(
-                engine,
-                steering_vectors,
-                global_vector,
-                profiles,
-                config,
-                discriminative_layers,
-            )
+            if getattr(config.steering, "frozen_experts", False):
+                # Same projection, applied to the expert output instead of the
+                # weight, so quantised experts never have to be unpacked.
+                _apply_frozen_ega_steering(
+                    engine,
+                    steering_vectors,
+                    global_vector,
+                    profiles,
+                    config,
+                    discriminative_layers,
+                )
+            else:
+                _apply_ega_steering(
+                    engine,
+                    steering_vectors,
+                    global_vector,
+                    profiles,
+                    config,
+                    discriminative_layers,
+                )
         # Legacy top-N router suppression (complementary to EGA).
         if safety_experts and routing_config:
             _apply_moe_steering(
@@ -1000,6 +1012,119 @@ def _apply_ega_steering(
         )
         fused.data.copy_(W_new.to(fused.dtype))
         del W_new
+
+
+def _apply_frozen_ega_steering(
+    engine,
+    steering_vectors: Tensor,
+    global_vector: Tensor | None,
+    profiles: dict[str, SteeringProfile],
+    config: AbliterixConfig,
+    discriminative_layers: set[int] | None,
+):
+    """EGA applied at forward time, leaving quantised expert weights packed.
+
+    Same per-layer strengths and same projection as :func:`_apply_ega_steering`
+    — but installed as hooks on each MoE block rather than written into the
+    fused weight, because the rank-1 edit is algebraically identical to
+    projecting the direction out of the expert output (see
+    :mod:`abliterix.core.frozen_experts`). Nothing is dequantised, so a natively
+    4-bit MoE stays at its packed size for the whole search.
+
+    Handles land in ``engine._angular_hooks`` so ``restore_baseline`` removes
+    them along with the other runtime-hook modes.
+    """
+    from .frozen_experts import build_frozen_plan, install_frozen_ega_on_moe_block
+
+    kernel = config.steering.decay_kernel
+
+    sp = profiles.get("mlp.down_proj")
+    if sp is None:
+        return
+
+    if not hasattr(engine, "_angular_hooks"):
+        engine._angular_hooks = []
+
+    installed = 0
+    for layer_idx in range(len(engine.transformer_layers)):
+        if discriminative_layers is not None and layer_idx not in discriminative_layers:
+            continue
+
+        layer = engine.transformer_layers[layer_idx]
+        experts = _locate_expert_container(layer)
+        if experts is None:
+            continue
+
+        distance = cast(float, abs(layer_idx - sp.max_weight_position))
+        if distance > sp.min_weight_distance:
+            continue
+        t = distance / sp.min_weight_distance
+        if kernel == DecayKernel.GAUSSIAN:
+            strength = sp.min_weight + (sp.max_weight - sp.min_weight) * math.exp(
+                -2.0 * t * t
+            )
+        elif kernel == DecayKernel.COSINE:
+            strength = sp.min_weight + (sp.max_weight - sp.min_weight) * (
+                0.5 * (1.0 + math.cos(math.pi * t))
+            )
+        else:
+            strength = sp.max_weight + t * (sp.min_weight - sp.max_weight)
+        if strength == 0:
+            continue
+
+        v = (
+            global_vector
+            if global_vector is not None
+            else steering_vectors[layer_idx + 1]
+        )
+        if v.ndim != 1:
+            continue
+
+        # No weights are read: preserve_row_norm is rejected by config
+        # validation for this mode, so the plan is entirely weight-free.
+        plan = build_frozen_plan(
+            None,
+            v.detach().to(torch.float32),
+            float(strength),
+            axis_is_in=True,
+            preserve_row_norm=False,
+        )
+        handles = install_frozen_ega_on_moe_block(
+            experts,
+            plan,
+            router_module=engine._locate_router(layer),
+            expert_bias=getattr(experts, "down_proj_bias", None),
+        )
+        engine._angular_hooks.extend(handles)
+        installed += 1
+
+    if installed and config.display.print_responses:
+        print(f"* frozen EGA: hooked {installed} MoE blocks (experts left packed)")
+
+
+def _locate_expert_container(layer) -> object | None:
+    """Find the module that computes the combined expert output for a layer.
+
+    Deliberately the *container*, not the individual experts: its output is the
+    routing-weighted sum, and the projection is linear, so projecting the sum
+    equals projecting each expert's contribution.
+    """
+    for path in (
+        "mlp.experts",
+        "block_sparse_moe.experts",
+        "feed_forward.experts",
+        "moe.experts",
+        "mixer.experts",
+        "ffn.experts",
+    ):
+        obj = layer
+        for attr in path.split("."):
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj is not None and hasattr(obj, "register_forward_hook"):
+            return obj
+    return None
 
 
 # ---------------------------------------------------------------------------

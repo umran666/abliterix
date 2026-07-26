@@ -501,7 +501,17 @@ class SteeringEngine:
                 # Without this override, transformers wraps the experts in
                 # Mxfp4GptOssExperts whose `down_proj` is a packed triton
                 # tensor that _locate_fused_weights cannot edit.
-                if self._is_native_mxfp4 and qconfig is None:
+                #
+                # `steering.frozen_experts` is exactly the case where we do NOT
+                # want that: forward-time EGA never touches the weights, so the
+                # experts stay packed and the model loads at its 4-bit size
+                # (gpt-oss-20b: ~13.8 GB rather than ~30 GB).
+                if getattr(config.steering, "frozen_experts", False):
+                    print(
+                        "  [dim]frozen_experts: keeping MXFP4 experts packed "
+                        "(forward-time EGA, no weight mutation)[/]"
+                    )
+                elif self._is_native_mxfp4 and qconfig is None:
                     try:
                         from transformers import Mxfp4Config
 

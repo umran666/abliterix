@@ -218,7 +218,10 @@ class FrozenEgaPlan:
 
 
 def weighted_bias_projection(
-    bias: Tensor, direction: Tensor, routing_weights: Tensor
+    bias: Tensor,
+    direction: Tensor,
+    routing_weights: Tensor,
+    expert_indices: Tensor | None = None,
 ) -> Tensor:
     """``B·d`` per token, where ``B = Σ_e w[token,e] · bias[e]``.
 
@@ -227,13 +230,30 @@ def weighted_bias_projection(
     whose expert down-projection carries a bias (gpt-oss does: ``down_proj_bias``
     is ``(E, hidden)``).
 
-    ``bias`` is ``(E, out)``, ``routing_weights`` is ``(tokens, E)`` — the same
-    scores the MoE block uses to combine experts. Returns ``(tokens,)``.
+    ``bias`` is ``(E, out)``. ``routing_weights`` may be either form real MoE
+    blocks use:
+
+    * **dense** ``(tokens, E)`` — a full score per expert;
+    * **top-k** ``(tokens, k)`` together with ``expert_indices`` ``(tokens, k)``,
+      which is what an actual router emits (gpt-oss passes its experts
+      ``(76, 4)`` int64 indices and ``(76, 4)`` scores). Handled directly rather
+      than making the caller scatter it into a dense matrix first.
+
+    Returns ``(tokens,)``.
     """
     b = bias.to(torch.float32)
     d = direction.to(dtype=torch.float32, device=b.device)
     per_expert = b @ d  # (E,)
-    return routing_weights.to(dtype=torch.float32, device=b.device) @ per_expert
+    w = routing_weights.to(dtype=torch.float32, device=b.device)
+    if expert_indices is None:
+        return w @ per_expert
+    idx = expert_indices.to(device=b.device).long()
+    if idx.shape != w.shape:
+        raise ValueError(
+            f"top-k routing needs matching shapes, got scores {tuple(w.shape)} "
+            f"and indices {tuple(idx.shape)}"
+        )
+    return (w * per_expert[idx]).sum(dim=-1)
 
 
 def _gather_expert_scales(

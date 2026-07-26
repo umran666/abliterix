@@ -480,3 +480,59 @@ def test_installed_hook_applies_bias_correction_from_forward_args():
     routing2 = torch.softmax(torch.randn(T, E), dim=-1)
     want2 = _moe_reference(x, W, bias, routing2, edited_W=W_edit)
     assert torch.allclose(mod(x, routing2), want2, atol=1e-4)
+
+
+def test_weighted_bias_projection_accepts_topk_routing():
+    """Real routers emit top-k (indices, scores), not a dense score matrix.
+
+    gpt-oss hands its experts (tokens, 4) int64 indices and (tokens, 4) scores;
+    densifying that by hand is exactly the step this overload removes.
+    """
+    torch.manual_seed(44)
+    E, d_out, T, K = 8, 11, 6, 4
+    bias = torch.randn(E, d_out)
+    d = torch.randn(d_out)
+    idx = torch.stack([torch.randperm(E)[:K] for _ in range(T)])
+    scores = torch.softmax(torch.randn(T, K), dim=-1)
+
+    got = weighted_bias_projection(bias, d, scores, idx)
+
+    dense = torch.zeros(T, E)
+    dense.scatter_(1, idx, scores)
+    assert torch.allclose(got, weighted_bias_projection(bias, d, dense), atol=1e-5)
+
+
+def test_weighted_bias_projection_topk_shape_mismatch_raises():
+    bias = torch.randn(4, 6)
+    d = torch.randn(6)
+    with pytest.raises(ValueError, match="matching shapes"):
+        weighted_bias_projection(bias, d, torch.randn(3, 2), torch.zeros(3, 3).long())
+
+
+def test_topk_bias_correction_matches_weight_edit():
+    """End to end with top-k routing: corrected hook == weight edit."""
+    torch.manual_seed(45)
+    E, d_in, d_out, T, K = 6, 9, 12, 5, 3
+    W = torch.randn(E, d_in, d_out)
+    bias = torch.randn(E, d_out) * 0.5
+    d = torch.randn(d_out)
+    d = d / d.norm()
+    strength = 2.0
+
+    idx = torch.stack([torch.randperm(E)[:K] for _ in range(T)])
+    sc = torch.softmax(torch.randn(T, K), dim=-1)
+    dense = torch.zeros(T, E)
+    dense.scatter_(1, idx, sc)
+
+    x = torch.randn(T, d_in)
+    W_edit = apply_ega_projection(
+        W, d, strength=strength, axis_is_in=True, preserve_row_norm=False
+    )
+    want = _moe_reference(x, W, bias, dense, edited_W=W_edit)
+
+    y = _moe_reference(x, W, bias, dense)
+    plan = build_frozen_plan(
+        None, d, strength, axis_is_in=True, preserve_row_norm=False
+    )
+    corr = weighted_bias_projection(bias, d, sc, idx)
+    assert torch.allclose(plan.finish_output(y, bias_dot_d=corr), want, atol=1e-4)

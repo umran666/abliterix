@@ -196,15 +196,39 @@ Pass `bias_dot_d` (from `weighted_bias_projection(bias, d, router_scores)`) to
 `finish_output`, or give `install_frozen_ega_hook` a `bias_dot_d_fn`, and the
 hook matches the weight edit exactly.
 
-### Status
+### Using it
 
-The equivalence is proven in tests — for both layouts, with and without row-norm
-preservation, `forward_path(x) == x @ apply_ega_projection(W, ...)` — which is
-what lets a search on frozen weights hand its winning parameters to the bake
-above and get a checkpoint describing the same model.
+```toml
+[steering]
+steering_mode = "direct"
+frozen_experts = true
+weight_normalization = "none"   # required: see below
+```
 
-**Not yet wired into the engine's steering-mode dispatch**, and the container
-hook has not been validated on a real model. A fused multi-expert container also
-cannot do row-norm preservation (the factors are per expert and the hook cannot
-see per-token routing); `install_frozen_ega_hook` raises rather than
-approximating.
+The engine then skips `Mxfp4Config(dequantize=True)`, so the experts stay packed,
+and EGA dispatches to hooks instead of writing the fused weight. Handles land in
+`engine._angular_hooks`, so `restore_baseline` already removes them between
+trials. Export the winning plan with `--emit-fp4-plan` and bake it with
+`abliterix-abliterate-fp4`.
+
+Row-norm preservation is **rejected by config validation** in this mode: the
+factors are per expert, and a container-level hook cannot see which expert a
+token was routed to.
+
+### Validation (gpt-oss-20b, RTX 5090)
+
+Equivalence is proven in CPU tests for both layouts, with and without row-norm
+preservation — `forward_path(x) == x @ apply_ega_projection(W, ...)` — and
+measured on the real model at layer 12, strength 4.0:
+
+| | |
+|---|---|
+| kernel-noise floor (neither path edited) | 0.0058 |
+| naive hook vs weight edit | 0.0230 — diverges |
+| **bias-corrected hook vs weight edit** | **0.0063 — within the floor** |
+| VRAM, whole model frozen | **13.77 GB** (vs ~30 GB dequantised) |
+| hook overhead | 0.01 GB |
+
+End to end through the engine dispatch: experts stayed `Mxfp4GptOssExperts`,
+48 handles installed across 24 layers, generation changed under the hooks and
+returned exactly to baseline once they were removed.

@@ -379,6 +379,82 @@ def install_frozen_ega_hook(module, plan: FrozenEgaPlan, *, bias_dot_d_fn=None):
     return handles
 
 
+class RoutingCapture:
+    """Stashes the most recent ``(scores, indices)`` a router emitted.
+
+    The expert container is not a usable place to read routing from: on the
+    packed gpt-oss path it receives ``triton_kernels`` objects
+    (``RoutingData``/``GatherIndx``, one of them passed as a keyword so a plain
+    forward hook does not even see it), while the dequantised path receives
+    plain tensors. The **router** is an ordinary module on both paths and emits
+    plain tensors, so read it there instead.
+
+    Scores and indices are told apart by dtype (indices are integral) and are
+    required to share a shape — real routers emit top-k pairs like
+    ``(tokens, 4)``.
+    """
+
+    def __init__(self) -> None:
+        self.scores: Tensor | None = None
+        self.indices: Tensor | None = None
+
+    def __call__(self, _module, _args, output) -> None:
+        items = output if isinstance(output, (tuple, list)) else (output,)
+        tensors = [t for t in items if isinstance(t, Tensor)]
+        ints = [t for t in tensors if not t.dtype.is_floating_point]
+        for i in ints:
+            for f in tensors:
+                if f.dtype.is_floating_point and f.shape == i.shape:
+                    self.scores, self.indices = f.detach(), i.detach()
+                    return
+        # Dense routing: a single float tensor, no index companion.
+        floats = [t for t in tensors if t.dtype.is_floating_point]
+        if len(floats) == 1:
+            self.scores, self.indices = floats[0].detach(), None
+
+
+def install_frozen_ega_on_moe_block(
+    experts_module,
+    plan: FrozenEgaPlan,
+    *,
+    router_module=None,
+    expert_bias: Tensor | None = None,
+):
+    """Wire forward-time EGA onto one MoE block, returning hook handles.
+
+    Hooks the expert container's output to project the direction out, and — when
+    the experts carry a down-projection bias — also hooks ``router_module`` to
+    capture the routing needed to keep that bias out of the projection (EGA
+    edits the weight only; see :func:`weighted_bias_projection`).
+
+    Measured on gpt-oss-20b layer 12 at strength 4.0: without the correction the
+    hooked block differs from the weight edit by 0.0230 against a kernel-noise
+    floor of 0.0058; with it, 0.0063. Passing ``expert_bias`` is therefore not
+    optional on architectures that have one.
+    """
+    handles = []
+    capture: RoutingCapture | None = None
+
+    if expert_bias is not None and router_module is not None:
+        capture = RoutingCapture()
+        handles.append(router_module.register_forward_hook(capture))
+        bias = expert_bias.detach()
+
+        def _bias_dot_d(_args):
+            if capture is None or capture.scores is None:
+                return None
+            return weighted_bias_projection(
+                bias, plan.direction, capture.scores, capture.indices
+            )
+
+        bias_fn = _bias_dot_d
+    else:
+        bias_fn = None
+
+    handles.extend(install_frozen_ega_hook(experts_module, plan, bias_dot_d_fn=bias_fn))
+    return handles
+
+
 def apply_frozen_ega(
     x: Tensor,
     W: Tensor,

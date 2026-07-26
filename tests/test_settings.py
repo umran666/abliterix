@@ -170,3 +170,40 @@ def test_strength_range_is_list():
     assert isinstance(cfg.strength_range, list)
     assert len(cfg.strength_range) == 2
     assert cfg.strength_range[0] < cfg.strength_range[1]
+
+
+def test_frozen_experts_requires_direct_mode():
+    import pytest
+
+    with pytest.raises(ValueError, match="requires steering_mode='direct'"):
+        AbliterixConfig(
+            model={"model_id": "x"},
+            steering={"frozen_experts": True, "steering_mode": "lora"},
+        )
+
+
+def test_frozen_experts_rejects_row_norm_preservation():
+    """Per-expert rescale factors need per-token routing a container hook lacks."""
+    import pytest
+
+    with pytest.raises(ValueError, match="cannot preserve row norms"):
+        AbliterixConfig(
+            model={"model_id": "x"},
+            steering={
+                "frozen_experts": True,
+                "steering_mode": "direct",
+                "weight_normalization": "full",
+            },
+        )
+
+
+def test_frozen_experts_valid_combo_accepted():
+    cfg = AbliterixConfig(
+        model={"model_id": "x"},
+        steering={
+            "frozen_experts": True,
+            "steering_mode": "direct",
+            "weight_normalization": "none",
+        },
+    )
+    assert cfg.steering.frozen_experts is True

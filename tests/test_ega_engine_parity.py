@@ -157,3 +157,135 @@ def test_direct_steering_refuses_bnb_quantized_base_weight():
     }
     with pytest.raises(RuntimeError, match="cannot edit quantised base weight"):
         _apply_direct_steering(engine, svs, None, profiles, _config(), None)
+
+
+# ---------------------------------------------------------------------------
+# frozen_experts dispatch: hooks instead of weight mutation
+# ---------------------------------------------------------------------------
+
+
+class _Router(nn.Module):
+    def __init__(self, hidden, n_exp, top_k=2):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(n_exp, hidden))
+        self.top_k = top_k
+
+    def forward(self, x):
+        logits = x @ self.weight.T
+        scores, idx = torch.topk(torch.softmax(logits, -1), self.top_k, dim=-1)
+        return scores, idx
+
+
+class _Experts(nn.Module):
+    """Stands in for a packed container: W is a buffer, never edited."""
+
+    def __init__(self, n_exp, hidden, inter):
+        super().__init__()
+        self.register_buffer("W", torch.randn(n_exp, inter, hidden) * 0.05)
+        self.register_buffer("down_proj_bias", torch.randn(n_exp, hidden) * 0.1)
+        self.register_buffer("up", torch.randn(hidden, inter) * 0.05)
+
+    def forward(self, x, indices, scores):
+        acts = x @ self.up
+        out = torch.zeros_like(x)
+        for k in range(indices.shape[-1]):
+            for e in range(self.W.shape[0]):
+                m = indices[:, k] == e
+                if m.any():
+                    out[m] += scores[m, k : k + 1] * (
+                        acts[m] @ self.W[e] + self.down_proj_bias[e]
+                    )
+        return out
+
+
+class _MoEBlock(nn.Module):
+    def __init__(self, hidden, inter, n_exp):
+        super().__init__()
+        self.router = _Router(hidden, n_exp)
+        self.experts = _Experts(n_exp, hidden, inter)
+
+    def forward(self, x):
+        scores, idx = self.router(x)
+        return self.experts(x, idx, scores)
+
+
+def _frozen_engine(n_layers=2, hidden=8, inter=12, n_exp=3):
+    torch.manual_seed(50)
+    layers = [
+        SimpleNamespace(mlp=_MoEBlock(hidden, inter, n_exp)) for _ in range(n_layers)
+    ]
+    return SimpleNamespace(
+        transformer_layers=layers,
+        _locate_router=lambda layer: layer.mlp.router,
+        _angular_hooks=[],
+    )
+
+
+def _frozen_config():
+    return SimpleNamespace(
+        steering=SimpleNamespace(
+            decay_kernel=DecayKernel.LINEAR,
+            weight_normalization=WeightNorm.NONE,
+            frozen_experts=True,
+        ),
+        display=SimpleNamespace(print_responses=False),
+    )
+
+
+def test_frozen_ega_installs_hooks_without_touching_weights():
+    from abliterix.core.steering import _apply_frozen_ega_steering
+
+    engine = _frozen_engine()
+    hidden = 8
+    before = [layer.mlp.experts.W.clone() for layer in engine.transformer_layers]
+    x = torch.randn(5, hidden)
+    baseline = [layer.mlp(x).clone() for layer in engine.transformer_layers]
+
+    svs = torch.randn(len(engine.transformer_layers) + 1, hidden)
+    profiles = {"mlp.down_proj": SteeringProfile(2.0, 0.0, 2.0, 100.0)}
+    _apply_frozen_ega_steering(engine, svs, None, profiles, _frozen_config(), None)
+
+    assert len(engine._angular_hooks) >= len(engine.transformer_layers)
+    # Weights are untouched — that is the entire point.
+    for layer, w0 in zip(engine.transformer_layers, before):
+        assert torch.equal(layer.mlp.experts.W, w0)
+    # ...but the output changed.
+    for layer, y0 in zip(engine.transformer_layers, baseline):
+        assert not torch.allclose(layer.mlp(x), y0, atol=1e-4)
+
+    # restore_baseline's cleanup removes them and restores the original output.
+    for h in engine._angular_hooks:
+        h.remove()
+    engine._angular_hooks = []
+    for layer, y0 in zip(engine.transformer_layers, baseline):
+        assert torch.allclose(layer.mlp(x), y0, atol=1e-5)
+
+
+def test_frozen_ega_matches_the_weight_edit_it_replaces():
+    """Hooked frozen block == the same block with its expert weight edited."""
+    from abliterix.core.steering import _apply_frozen_ega_steering
+    from abliterix.weight_transforms import apply_ega_projection
+
+    hidden, strength = 8, 1.5
+    engine = _frozen_engine(n_layers=1, hidden=hidden)
+    layer = engine.transformer_layers[0]
+    x = torch.randn(6, hidden)
+
+    svs = torch.randn(2, hidden)
+    profiles = {"mlp.down_proj": SteeringProfile(strength, 0.0, strength, 100.0)}
+    _apply_frozen_ega_steering(engine, svs, None, profiles, _frozen_config(), None)
+    hooked = layer.mlp(x)
+
+    for h in engine._angular_hooks:
+        h.remove()
+    engine._angular_hooks = []
+
+    # Reference: mutate the weight the way _apply_ega_steering would.
+    W = layer.mlp.experts.W
+    W.copy_(
+        apply_ega_projection(
+            W, svs[1], strength=strength, axis_is_in=True, preserve_row_norm=False
+        ).to(W.dtype)
+    )
+    edited = layer.mlp(x)
+    assert torch.allclose(hooked, edited, atol=1e-4)

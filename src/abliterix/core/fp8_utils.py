@@ -61,7 +61,14 @@ import torch
 import torch.nn as nn
 
 _FP8_DTYPES: frozenset = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
-_SCALE_ATTRS: tuple[str, ...] = ("weight_scale_inv", "weight_scale")
+
+# Sibling key/attribute names a producer may use for an FP8 weight's scale.
+# DeepSeek-V4-Flash uses a bare ``.scale`` (``layers.L.attn.wo_b.scale``,
+# ``float8_e8m0fnu``, one entry per 128x128 block); DeepSeek-V3 / MiniMax /
+# Qwen3-FP8 use ``weight_scale_inv``; per-tensor FP8 uses ``weight_scale``.
+# Missing a name here is not a soft failure: the weight silently falls through
+# to a bare dtype cast and every block scale is dropped.
+_SCALE_ATTRS: tuple[str, ...] = ("weight_scale_inv", "weight_scale", "scale")
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +196,103 @@ def dequant_blockwise_3d(
     for e in range(E):
         out[e] = dequant_blockwise(fp8_weight[e], scale[e], is_inv, out_dtype)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Quant kernels — the inverse direction, so an edited tensor can be written
+# back as FP8 instead of forcing the whole checkpoint to BF16.
+# ---------------------------------------------------------------------------
+
+_E4M3_MAX: float = 448.0
+_FP8_E8M0 = getattr(torch, "float8_e8m0fnu", None)
+
+
+def quantize_to_fp8_blockwise(
+    w: torch.Tensor,
+    block_size: tuple[int, int] = (128, 128),
+    *,
+    weight_dtype: torch.dtype = torch.float8_e4m3fn,
+    scale_dtype: torch.dtype | None = None,
+    power_of_two_scale: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """BF16/FP32 → block-wise FP8. Returns ``(fp8_weight, scale)``.
+
+    The inverse of :func:`dequant_blockwise` with ``is_inv=True``, i.e. the
+    convention where ``W_real[i,j] = W_fp8[i,j] * scale[i//br, j//bc]``.
+
+    Each ``block_r × block_c`` tile gets the smallest scale that keeps every
+    element inside e4m3's ±448 range. ``power_of_two_scale`` rounds that up to
+    a power of two, which is required when the producer stores scales as
+    ``float8_e8m0fnu`` (DeepSeek-V4 does) and harmless otherwise — a
+    power-of-two scale divides exactly, so it adds no rounding of its own.
+
+    ``scale_dtype`` defaults to ``float8_e8m0fnu`` when scales are powers of two
+    and that dtype exists, else float32. Pass it explicitly to match a
+    checkpoint's existing scale tensor.
+    """
+    w32 = w.to(torch.float32)
+    if w32.dim() != 2:
+        raise ValueError(f"expected a 2-D weight, got {tuple(w.shape)}")
+    br, bc = block_size
+    rows, cols = w32.shape
+    n_r = (rows + br - 1) // br
+    n_c = (cols + bc - 1) // bc
+
+    # Per-block amax via padding to a whole number of blocks.
+    pad_r, pad_c = n_r * br - rows, n_c * bc - cols
+    padded = (
+        torch.nn.functional.pad(w32, (0, pad_c, 0, pad_r)) if (pad_r or pad_c) else w32
+    )
+    tiles = padded.reshape(n_r, br, n_c, bc).permute(0, 2, 1, 3)
+    amax = tiles.abs().amax(dim=(-2, -1))  # (n_r, n_c)
+
+    tiny = torch.finfo(torch.float32).tiny
+    scale = (amax / _E4M3_MAX).clamp(min=tiny)
+    if power_of_two_scale:
+        scale = torch.pow(2.0, torch.ceil(torch.log2(scale)))
+    scale = torch.where(amax > 0, scale, torch.ones_like(scale))
+
+    expanded = scale.repeat_interleave(br, dim=0).repeat_interleave(bc, dim=1)
+    fp8 = (w32 / expanded[:rows, :cols]).clamp(-_E4M3_MAX, _E4M3_MAX).to(weight_dtype)
+
+    if scale_dtype is None:
+        scale_dtype = (
+            _FP8_E8M0
+            if (power_of_two_scale and _FP8_E8M0 is not None)
+            else torch.float32
+        )
+    return fp8, scale.to(scale_dtype)
+
+
+def assert_fp8_repack_idempotent(
+    fp8_weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    name: str = "<tensor>",
+) -> None:
+    """Verify dequant→requant is a fixed point on already-quantised weights.
+
+    Values already on the FP8 grid must survive the round trip untouched. Drift
+    here means the quant and dequant conventions disagree (a scale inverted, a
+    block size misread, a lossy dtype cast), which would corrupt weights quietly
+    rather than raising.
+    """
+    br = max(1, fp8_weight.shape[0] // scale.shape[0])
+    bc = max(1, fp8_weight.shape[1] // scale.shape[1])
+    w = dequant_blockwise(fp8_weight, scale, is_inv=True, out_dtype=torch.float32)
+    re_w, re_s = quantize_to_fp8_blockwise(
+        w,
+        (br, bc),
+        weight_dtype=fp8_weight.dtype,
+        scale_dtype=scale.dtype,
+    )
+    w2 = dequant_blockwise(re_w, re_s, is_inv=True, out_dtype=torch.float32)
+    if not torch.equal(w.cpu(), w2.cpu()):
+        drift = (w.cpu() - w2.cpu()).abs().max().item()
+        raise AssertionError(
+            f"FP8 repack of '{name}' drifted by {drift:g} on already-quantised "
+            "input — the quant/dequant conventions do not agree."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -523,13 +627,20 @@ def dequant_safetensors_shard(
     src_shard: Path,
     dst_shard: Path,
     use_cuda: bool = True,
+    allow_unscaled: bool = False,
 ) -> tuple[int, int]:
     """Read ``src_shard``, dequant FP8 tensors to BF16, write ``dst_shard``.
 
     Returns ``(num_tensors_written, num_dequanted)``.
 
-    Strips ``weight_scale_inv`` and ``weight_scale`` keys from the output since
-    those are only meaningful in FP8 context.
+    Scale keys (see ``_SCALE_ATTRS``) are stripped from the output since they
+    are only meaningful in FP8 context.
+
+    An FP8 tensor with no sibling scale raises, because the usual cause is an
+    unrecognised scale suffix rather than a genuinely unscaled checkpoint, and
+    casting it bare would silently drop the block scaling. ``allow_unscaled``
+    opts into the bare cast for checkpoints that really do store FP8 without
+    scales.
     """
     from safetensors import safe_open
     from safetensors.torch import save_file
@@ -577,9 +688,30 @@ def dequant_safetensors_shard(
                 elif scale is not None and scale.dim() == 0:
                     # Scalar per-tensor scale
                     bf16 = dequant_per_tensor(t, scale)
-                else:
-                    # Unscaled FP8 → bare cast.
+                elif scale is None and allow_unscaled:
                     bf16 = dequant_per_tensor(t, None)
+                elif scale is None:
+                    # No sibling scale found. Genuinely-unscaled FP8 exists but
+                    # is rare; far more likely the producer names its scale
+                    # something not in _SCALE_ATTRS, in which case a bare cast
+                    # silently discards every block scale and writes plausible
+                    # but wrong weights. Refuse instead of guessing.
+                    raise ValueError(
+                        f"FP8 tensor '{k}' has no sibling scale among "
+                        f"{_SCALE_ATTRS}. Dequantising it as unscaled would "
+                        "silently drop the block scaling and corrupt the "
+                        "output. Add this producer's scale suffix to "
+                        "_SCALE_ATTRS, or pass allow_unscaled=True if the "
+                        "checkpoint really stores FP8 without scales."
+                    )
+                else:
+                    # Scale found but its rank does not pair with the weight's.
+                    raise ValueError(
+                        f"FP8 tensor '{k}' {tuple(t.shape)} has a scale of "
+                        f"rank {scale.dim()} {tuple(scale.shape)} that does not "
+                        "match any supported layout (2-D block-wise, 3-D fused "
+                        "MoE, or scalar per-tensor)."
+                    )
 
                 out_tensors[k] = bf16
                 n_dequant += 1
@@ -600,6 +732,7 @@ def dequant_model_to_disk(
     dst_dir: Path,
     use_cuda: bool = True,
     verbose: bool = True,
+    allow_unscaled: bool = False,
 ) -> int:
     """Offline pre-dequant a local FP8 model to a standalone BF16 directory.
 
@@ -651,7 +784,7 @@ def dequant_model_to_disk(
                 flush=True,
             )
         n_total, n_dequant = dequant_safetensors_shard(
-            src_shard, dst_shard, use_cuda=use_cuda
+            src_shard, dst_shard, use_cuda=use_cuda, allow_unscaled=allow_unscaled
         )
         shard_size = dst_shard.stat().st_size
         total_bytes += shard_size

@@ -127,6 +127,23 @@ def _save_model_locally(config: AbliterixConfig, engine: SteeringEngine):
     print(f"Model saved to [bold]{save_dir}[/].")
 
 
+
+def _save_lora_adapter_locally(config: AbliterixConfig, engine: SteeringEngine):
+    """Save only the PEFT LoRA adapter and tokenizer files."""
+    save_dir = ask_path("Path to the adapter folder:")
+    if not save_dir:
+        return
+
+    if not hasattr(engine.model, "save_pretrained"):
+        raise RuntimeError("Current model does not support save_pretrained().")
+
+    print("Saving LoRA adapter only...")
+    engine.model.save_pretrained(save_dir, safe_serialization=True)
+    engine.tokenizer.save_pretrained(save_dir)
+    print(f"LoRA adapter saved to [bold]{save_dir}[/].")
+    print("[green]Base model weights were not merged or exported.[/]")
+
+
 def _upload_model(
     config: AbliterixConfig,
     engine: SteeringEngine,
@@ -597,6 +614,7 @@ def show_interactive_results(
                     "What do you want to do with the decensored model?",
                     [
                         "Save the model to a local folder",
+                        "Save LoRA adapter only",
                         "Upload the model to Hugging Face",
                         "Chat with the model",
                         "Run standard benchmarks (lm-eval)",
@@ -611,6 +629,9 @@ def show_interactive_results(
                     match action:
                         case "Save the model to a local folder":
                             _save_model_locally(trial_config, engine)
+
+                        case "Save LoRA adapter only":
+                            _save_lora_adapter_locally(trial_config, engine)
 
                         case "Upload the model to Hugging Face":
                             _upload_model(trial_config, engine, scorer, trial)

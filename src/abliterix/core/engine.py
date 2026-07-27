@@ -129,9 +129,7 @@ def resolve_model_class(
     if isinstance(config, dict) and config.get("model_type") == "qwen3_5_moe":
         return AutoModelForCausalLM
 
-    if any(
-        isinstance(cfg, dict) and "vision_config" in cfg for cfg in config_dicts
-    ):
+    if any(isinstance(cfg, dict) and "vision_config" in cfg for cfg in config_dicts):
         return AutoModelForImageTextToText
     return AutoModelForCausalLM
 
@@ -633,9 +631,9 @@ class SteeringEngine:
         # bnb 4-bit: non-quantized tensors (embed/norm/lm_head) may still be
         # float16 when load dtype is float16. Promote them to bf16 so deep
         # residual norms do not overflow to inf/NaN.
-        if (
-            config.model.quant_method == QuantMode.BNB_4BIT
-            and dtype not in ("bfloat16", "auto")
+        if config.model.quant_method == QuantMode.BNB_4BIT and dtype not in (
+            "bfloat16",
+            "auto",
         ):
             n_conv = 0
             for _n, _p in self.model.named_parameters():
@@ -643,10 +641,7 @@ class SteeringEngine:
                     _p.data = _p.data.to(torch.bfloat16)
                     n_conv += 1
             if n_conv:
-                print(
-                    f"  [dim]Promoted {n_conv} non-quantized params "
-                    f"fp16→bf16[/]"
-                )
+                print(f"  [dim]Promoted {n_conv} non-quantized params fp16→bf16[/]")
 
         # NOTE: FP8 dequant is now applied inside the dtype loop (above),
         # before the smoke-test, so we no longer need it here.

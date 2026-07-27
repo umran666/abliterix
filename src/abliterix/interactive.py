@@ -127,7 +127,6 @@ def _save_model_locally(config: AbliterixConfig, engine: SteeringEngine):
     print(f"Model saved to [bold]{save_dir}[/].")
 
 
-
 def _save_lora_adapter_locally(config: AbliterixConfig, engine: SteeringEngine):
     """Save only the PEFT LoRA adapter and tokenizer files."""
     save_dir = ask_path("Path to the adapter folder:")

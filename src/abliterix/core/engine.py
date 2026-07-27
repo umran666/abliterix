@@ -120,7 +120,18 @@ def resolve_model_class(
     use ``AutoModelForCausalLM``.
     """
     configs = PretrainedConfig.get_config_dict(model_id)
-    if any("vision_config" in cfg for cfg in configs):
+    config_dicts = configs if isinstance(configs, tuple) else (configs,)
+    config = config_dicts[0] if isinstance(config_dicts[0], dict) else {}
+
+    # Qwen3.5-MoE / Agents-A1 expose multimodal config fields, but Abliterix
+    # steers only the language model. Loading via ImageTextToText adds vision
+    # plumbing and can break text-only local runs.
+    if isinstance(config, dict) and config.get("model_type") == "qwen3_5_moe":
+        return AutoModelForCausalLM
+
+    if any(
+        isinstance(cfg, dict) and "vision_config" in cfg for cfg in config_dicts
+    ):
         return AutoModelForImageTextToText
     return AutoModelForCausalLM
 
@@ -351,6 +362,10 @@ class SteeringEngine:
         self.response_prefix = ""
         self.needs_reload = False
         self._dequant_cache: dict[int, Tensor] = {}
+        self._dequant_cache_bytes: int = 0
+        # Cap dequant cache so large MoE expert counts cannot retain
+        # hundreds of GB of fp32 weights in RAM.
+        self._dequant_cache_max_bytes: int = 4 * 1024**3  # 4 GB
 
         # Cached metadata — populated by prepare_for_unload() before the HF
         # model is freed, so the optimizer can still query layer/component
@@ -614,6 +629,24 @@ class SteeringEngine:
 
         if self.model is None:
             raise RuntimeError("Failed to load model with all configured dtypes.")
+
+        # bnb 4-bit: non-quantized tensors (embed/norm/lm_head) may still be
+        # float16 when load dtype is float16. Promote them to bf16 so deep
+        # residual norms do not overflow to inf/NaN.
+        if (
+            config.model.quant_method == QuantMode.BNB_4BIT
+            and dtype not in ("bfloat16", "auto")
+        ):
+            n_conv = 0
+            for _n, _p in self.model.named_parameters():
+                if _p.dtype == torch.float16:
+                    _p.data = _p.data.to(torch.bfloat16)
+                    n_conv += 1
+            if n_conv:
+                print(
+                    f"  [dim]Promoted {n_conv} non-quantized params "
+                    f"fp16→bf16[/]"
+                )
 
         # NOTE: FP8 dequant is now applied inside the dtype loop (above),
         # before the smoke-test, so we no longer need it here.
@@ -961,7 +994,11 @@ class SteeringEngine:
         """Translate the user-facing QuantMode into a BitsAndBytesConfig."""
         qm = self.config.model.quant_method
         if qm == QuantMode.BNB_4BIT:
-            compute_dtype = torch.bfloat16 if dtype == "auto" else getattr(torch, dtype)
+            # Always use bf16 compute for 4-bit. Matching compute_dtype to a
+            # float16 *load* dtype is a common ROCm/MoE footgun: experts may
+            # remain unquantized and blow past RAM, while deep residual norms
+            # also prefer bf16 dynamic range.
+            compute_dtype = torch.bfloat16
             return BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=compute_dtype,
@@ -1197,6 +1234,7 @@ class SteeringEngine:
         # anything left here pins the model's VRAM after
         # ``engine.model = None`` (issue #83).
         self._dequant_cache.clear()
+        self._dequant_cache_bytes = 0
         for handle in getattr(self, "_angular_hooks", []):
             handle.remove()
         self._angular_hooks = []

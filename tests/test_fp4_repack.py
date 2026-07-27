@@ -743,3 +743,154 @@ def test_deepseek_end_to_end_bake(tmp_path):
     assert torch.equal(
         out["layers.0.ffn.gate.weight"], tensors["layers.0.ffn.gate.weight"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Mixed FP4 + FP8 checkpoints (the DeepSeek-V4 shape: 4-bit routed experts,
+# block-wise FP8 attention and shared experts)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_fp8_keys():
+    from abliterix.core import fp8_utils as f8
+
+    w = torch.randn(256, 256) * 0.05
+    fp8, scale = f8.quantize_to_fp8_blockwise(w, (128, 128))
+    tensors = {"attn.wo_b.weight": fp8, "attn.wo_b.scale": scale}
+    present = set(tensors)
+
+    # By module prefix and by full weight key.
+    assert rp.resolve_fp8_keys("attn.wo_b", present, tensors) == (
+        "attn.wo_b.weight",
+        "attn.wo_b.scale",
+    )
+    assert rp.resolve_fp8_keys("attn.wo_b.weight", present, tensors) == (
+        "attn.wo_b.weight",
+        "attn.wo_b.scale",
+    )
+    # A BF16 tensor is not FP8.
+    bf = {"norm.weight": torch.ones(8, 8, dtype=torch.bfloat16)}
+    assert rp.resolve_fp8_keys("norm.weight", set(bf), bf) is None
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e8m0fnu"), reason="torch lacks float8_e8m0fnu"
+)
+def test_mixed_fp4_and_fp8_bake(tmp_path):
+    """One pass edits 4-bit experts and block-wise FP8 attention together."""
+    from abliterix.core import fp8_utils as f8
+
+    src, dst = tmp_path / "hy", tmp_path / "hy_abl"
+    src.mkdir()
+    torch.manual_seed(60)
+    hidden, inter, n_exp = 128, 256, 2
+
+    tensors = {}
+    # 4-bit routed expert (DeepSeek layout: flat 2-D int8 + e8m0)
+    experts = {}
+    for e in range(n_exp):
+        w2 = torch.randn(hidden, inter) * 0.05
+        blocks, scales = f4.quantize_to_mxfp4(w2, 32)
+        base = f"layers.0.ffn.experts.{e}.w2"
+        tensors[base + ".weight"] = blocks.reshape(hidden, -1).view(torch.int8)
+        tensors[base + ".scale"] = scales.view(torch.float8_e8m0fnu)
+        experts[base] = (tensors[base + ".weight"], tensors[base + ".scale"])
+    # block-wise FP8 attention output projection
+    wo = torch.randn(hidden, hidden) * 0.03
+    fp8_w, fp8_s = f8.quantize_to_fp8_blockwise(wo, (128, 128))
+    tensors["layers.0.attn.wo_b.weight"] = fp8_w
+    tensors["layers.0.attn.wo_b.scale"] = fp8_s
+    # untouched BF16
+    tensors["layers.0.attn_norm.weight"] = torch.ones(hidden, dtype=torch.bfloat16)
+
+    save_file(tensors, str(src / "model.safetensors"), metadata={"format": "pt"})
+    (src / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v4",
+                "quantization_config": {"quant_method": "mxfp4"},
+            }
+        )
+    )
+
+    d = torch.randn(hidden)
+    d = d / d.norm()
+    edits = [
+        rp.TensorEdit(
+            f"layers.0.ffn.experts.{e}.w2", "ega", d, 2.0, True, hidden_dim=hidden
+        )
+        for e in range(n_exp)
+    ] + [
+        rp.TensorEdit(
+            "layers.0.attn.wo_b", "direct", d, 1.0, True, projection_side="output"
+        )
+    ]
+
+    stats = rp.abliterate_fp4_to_disk(src, dst, edits, use_cuda=False, verbose=False)
+    assert stats.fp4_edited == n_exp
+    assert stats.fp8_edited == 1
+    assert not stats.skipped_edits
+    assert stats.copied == 1  # the BF16 norm
+
+    from safetensors import safe_open
+
+    with safe_open(dst / "model.safetensors", framework="pt") as f:
+        out = {k: f.get_tensor(k) for k in f.keys()}
+
+    # FP8 tensor kept its stored dtypes and actually changed.
+    assert out["layers.0.attn.wo_b.weight"].dtype == torch.float8_e4m3fn
+    assert out["layers.0.attn.wo_b.scale"].dtype == torch.float8_e8m0fnu
+    got = f8.dequant_blockwise(
+        out["layers.0.attn.wo_b.weight"],
+        out["layers.0.attn.wo_b.scale"],
+        is_inv=True,
+        out_dtype=torch.float32,
+    )
+    orig = f8.dequant_blockwise(fp8_w, fp8_s, is_inv=True, out_dtype=torch.float32)
+    want = orig - 1.0 * d.unsqueeze(1) * (d @ orig).unsqueeze(0)
+    n0 = torch.linalg.vector_norm(orig, dim=1, keepdim=True)
+    n1 = torch.linalg.vector_norm(want, dim=1, keepdim=True).clamp(min=1e-8)
+    want = want * (n0 / n1)
+    assert (got - want).abs().mean() / want.abs().mean() < 0.1
+    assert not torch.allclose(got, orig, atol=1e-3)
+
+    # 4-bit expert also edited, and dtypes preserved.
+    assert out["layers.0.ffn.experts.0.w2.weight"].dtype == torch.int8
+    # Untouched tensor copied byte-for-byte.
+    assert torch.equal(
+        out["layers.0.attn_norm.weight"], torch.ones(hidden, dtype=torch.bfloat16)
+    )
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e8m0fnu"), reason="torch lacks float8_e8m0fnu"
+)
+def test_fp8_without_scale_is_refused_not_mangled(tmp_path):
+    """An FP8 weight whose scale we cannot find must raise, not fall to dense."""
+    from abliterix.core import fp8_utils as f8
+
+    src, dst = tmp_path / "ns", tmp_path / "ns_abl"
+    src.mkdir()
+    w = torch.randn(128, 128) * 0.05
+    fp8_w, _ = f8.quantize_to_fp8_blockwise(w, (128, 128))
+    save_file(
+        {"layers.0.attn.wo_b.weight": fp8_w},
+        str(src / "model.safetensors"),
+        metadata={"format": "pt"},
+    )
+    (src / "config.json").write_text(
+        json.dumps({"quantization_config": {"quant_method": "mxfp4"}})
+    )
+    d = torch.randn(128)
+    edits = [
+        rp.TensorEdit(
+            "layers.0.attn.wo_b.weight",
+            "direct",
+            d,
+            1.0,
+            True,
+            projection_side="output",
+        )
+    ]
+    with pytest.raises(ValueError, match="no scale sibling"):
+        rp.abliterate_fp4_to_disk(src, dst, edits, use_cuda=False, verbose=False)

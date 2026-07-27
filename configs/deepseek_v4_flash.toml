@@ -36,15 +36,24 @@ non_interactive = true
 #     standalone 4-bit checkpoint with `abliterix-abliterate-fp4`. Only the
 #     edited tensors are dequant->project->repacked; the rest is copied
 #     through, so the OUTPUT stays ~142 GB instead of a 568 GB BF16 merge.
+#     NOTE (fixed 2026-07): abliterix-dequant-fp8 used to CORRUPT this model.
+#     It looked for scale siblings named weight_scale_inv/weight_scale, while
+#     DeepSeek names them `.scale`, so it found none and fell back to a bare
+#     dtype cast — dropping every 128x128 block scale. Measured on
+#     layers.0.attn.wo_b: absmean 64.9 instead of 0.019 (3361x off). `.scale`
+#     is now recognised and an unscaled FP8 tensor raises instead of casting.
+#     The FP4 bake also edits the FP8 attention / shared experts directly now,
+#     so a full DSV4 abliteration no longer needs the BF16 detour at all.
+#
 #     STATUS for THIS model: SUPPORTED and verified against real weights —
 #     layout auto-detected, w2 keys resolve across all 43 layers, round-trip
 #     guard passes on untouched bytes, and an EGA edit repacks with ~2.7%
 #     requant error preserving the stored int8/e8m0 dtypes. Build the plan
 #     with `fp4_repack.build_per_expert_ega_plan(n_layers=43, n_experts=256,
 #     hidden_dim=4096)` — 11008 per-expert edits on `...experts.N.w2`.
-#     NOTE: only the 4-bit routed experts are repacked. Attention and shared
-#     experts are block-wise FP8 in this model, so `attn.wo_b` is NOT edited
-#     by the FP4 path; EGA on the experts is the mechanism here.
+#     All three precisions are handled in one pass: 4-bit routed experts,
+#     block-wise FP8 attention / shared experts, and BF16 copied through. So
+#     `attn.wo_b` IS editable here, alongside EGA on the experts.
 #   The old "packed FP4 cannot be written in place" limitation
 #   (vllm_live_suppression_dead_end.md) referred to *live* in-VRAM editing
 #   under vLLM; the offline repack sidesteps it by rebuilding the checkpoint.

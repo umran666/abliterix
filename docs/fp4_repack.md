@@ -129,8 +129,22 @@ plan = build_per_expert_ega_plan(
 
 The model is a **three-way hybrid**: routed experts 4-bit (141.7 GB, 88.8% of
 the checkpoint), shared experts + attention block-wise FP8 e4m3 128×128, plus
-some BF16. Only the 4-bit part is in scope here — the FP8 tensors are
-`fp8_utils` territory, so `attn.wo_b` is *not* edited by this path.
+some BF16. **All three are handled in one pass** — the bake dequants an FP8
+tensor with its block scale, projects, and re-quantises with
+`fp8_utils.quantize_to_fp8_blockwise`, preserving `float8_e4m3fn` /
+`float8_e8m0fnu`. Requant error there is ~2%, tighter than FP4's, since e4m3
+keeps 3 mantissa bits.
+
+> **`abliterix-dequant-fp8` used to corrupt this model.** It recognised only
+> `weight_scale_inv` / `weight_scale`; DeepSeek names its scale `.scale`, so the
+> tool found none and fell back to a bare dtype cast, dropping every block
+> scale. On `layers.0.attn.wo_b` that gives absmean 64.9 against the correct
+> 0.019 — 3361× off. `.scale` is now recognised, and an FP8 tensor with no
+> scale sibling raises rather than casting (`allow_unscaled=True` opts back in).
+
+> Key names alone cannot tell DeepSeek's 4-bit experts from its FP8 attention —
+> both are `<name>.weight` + `<name>.scale`. `resolve_fp4_keys` disambiguates by
+> dtype: packed FP4 is always an integer type, float8 storage never is.
 
 > One packaging detail worth knowing if you add another producer: DeepSeek
 > stores packed nibbles as **signed `int8`** and scales as `float8_e8m0fnu`.

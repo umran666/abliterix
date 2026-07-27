@@ -53,6 +53,7 @@ import torch
 from torch import Tensor
 
 from . import fp4_utils as f4
+from . import fp8_utils as f8
 from ..types import DecayKernel, DirectTransform, WeightNorm
 from ..weight_transforms import (
     apply_direct_transform,
@@ -535,6 +536,7 @@ def resolve_fp4_keys(
     present: set[str],
     fmt: f4.Fp4Format,
     layout: Fp4Layout | None = None,
+    tensors: dict[str, Tensor] | None = None,
 ) -> _Fp4KeySet | None:
     """Find the FP4 sibling keys for ``logical_name`` among ``present`` keys.
 
@@ -542,17 +544,51 @@ def resolve_fp4_keys(
     care (tests, one-off tools) keep working. Returns ``None`` if the tensor is
     not FP4-encoded under any layout — e.g. a plain BF16 weight that should be
     edited without repacking.
+
+    ``tensors`` disambiguates by dtype when supplied, which a mixed checkpoint
+    needs: DeepSeek-V4 names both its 4-bit experts and its block-wise **FP8**
+    attention ``<name>.weight`` + ``<name>.scale``, so key names alone would
+    hand an e4m3 tensor to the nibble decoder. Packed FP4 is always an integer
+    dtype; float8 storage never is.
     """
     for lay in (layout,) if layout is not None else _ALL_LAYOUTS:
         w = logical_name + lay.weight_suffix
         s = logical_name + lay.scale_suffix
         if w in present and s in present:
+            if tensors is not None:
+                wt = tensors.get(w)
+                if wt is not None and wt.dtype.is_floating_point:
+                    continue  # FP8 (or bf16) storage, not packed nibbles
             g = None
             for gsuf in lay.global_suffixes:
                 if logical_name + gsuf in present:
                     g = logical_name + gsuf
                     break
             return _Fp4KeySet(w, s, g)
+    return None
+
+
+def resolve_fp8_keys(
+    logical_name: str, present: set[str], tensors: dict[str, Tensor]
+) -> tuple[str, str] | None:
+    """Find ``(weight_key, scale_key)`` if ``logical_name`` is block-wise FP8.
+
+    ``logical_name`` may already be the weight key (``...wo_b.weight``) or the
+    module prefix (``...wo_b``). Returns ``None`` when the tensor is not FP8, so
+    the caller falls through to the FP4 or dense path.
+    """
+    w_key = logical_name if logical_name in present else f"{logical_name}.weight"
+    if w_key not in present:
+        return None
+    w = tensors.get(w_key)
+    if w is None or w.dtype not in f8._FP8_DTYPES or w.dim() != 2:
+        return None
+    prefix = w_key.rsplit(".", 1)[0] if "." in w_key else w_key
+    for suffix in f8._SCALE_ATTRS:
+        s_key = f"{prefix}.{suffix}"
+        if s_key in present and tensors.get(s_key) is not None:
+            if tensors[s_key].dim() == 2:
+                return w_key, s_key
     return None
 
 
@@ -724,6 +760,7 @@ def _assert_layout_roundtrip(
 class RepackStats:
     tensors_written: int = 0
     fp4_edited: int = 0
+    fp8_edited: int = 0
     dense_edited: int = 0
     copied: int = 0
     skipped_edits: list[str] = field(default_factory=list)
@@ -835,7 +872,7 @@ def abliterate_fp4_to_disk(
         consumed: set[str] = set()
 
         for name, edit in edit_by_name.items():
-            fp4_keys = resolve_fp4_keys(name, present, fmt, layout)
+            fp4_keys = resolve_fp4_keys(name, present, fmt, layout, tensors=src)
             if fp4_keys is not None:
                 W = _dequant_fp4_tensor(src, fp4_keys, fmt).to(device)
                 if verify_idempotent:
@@ -869,7 +906,58 @@ def abliterate_fp4_to_disk(
                 )
                 stats.fp4_edited += 1
                 remaining.discard(name)
+            elif (fp8_keys := resolve_fp8_keys(name, present, src)) is not None:
+                # Block-wise FP8 (DeepSeek-V4 attention + shared experts).
+                # Editing this through the dense branch would project the raw
+                # e4m3 values with the block scale ignored, so it gets its own
+                # dequant -> project -> requant, preserving the stored dtypes.
+                w_key, s_key = fp8_keys
+                W = f8.dequant_blockwise(
+                    src[w_key].to(device),
+                    src[s_key].to(device),
+                    is_inv=True,
+                    out_dtype=torch.float32,
+                )
+                if verify_idempotent:
+                    f8.assert_fp8_repack_idempotent(
+                        src[w_key].to(device), src[s_key].to(device), name=name
+                    )
+                try:
+                    W_new = apply_tensor_edit(W, edit)
+                except ValueError as e:
+                    if verbose:
+                        print(f"  [yellow]skip fp8 edit {name}: {e}[/]")
+                    stats.skipped_edits.append(name)
+                    continue
+                br = max(1, src[w_key].shape[0] // src[s_key].shape[0])
+                bc = max(1, src[w_key].shape[1] // src[s_key].shape[1])
+                new_w, new_s = f8.quantize_to_fp8_blockwise(
+                    W_new,
+                    (br, bc),
+                    weight_dtype=src[w_key].dtype,
+                    scale_dtype=src[s_key].dtype,
+                )
+                chk = f8.dequant_blockwise(
+                    new_w, new_s, is_inv=True, out_dtype=torch.float32
+                )
+                stats.requant_rel_err[name] = float(
+                    (chk - W_new).abs().mean() / W_new.abs().mean().clamp(min=1e-9)
+                )
+                out[w_key] = new_w.cpu()
+                out[s_key] = new_s.cpu()
+                consumed.update({w_key, s_key})
+                stats.fp8_edited += 1
+                remaining.discard(name)
             elif name in present:
+                if src[name].dtype in f8._FP8_DTYPES:
+                    # An FP8 weight whose scale sibling we could not find. The
+                    # dense path would project raw e4m3 values as if they were
+                    # the real weights — silently wrong. Refuse.
+                    raise ValueError(
+                        f"'{name}' is FP8 but no scale sibling was found among "
+                        f"{f8._SCALE_ATTRS}; editing it as a dense tensor would "
+                        "ignore the block scaling and corrupt the weight."
+                    )
                 # Plain (non-quantised) weight, e.g. gpt-oss attn.o_proj.
                 W = src[name].to(device)
                 try:
@@ -899,7 +987,8 @@ def abliterate_fp4_to_disk(
         if verbose:
             print(
                 f"[{i}/{len(shards)}] {fname}: "
-                f"{stats.fp4_edited} fp4-edited, {stats.dense_edited} dense-edited "
+                f"{stats.fp4_edited} fp4-edited, {stats.fp8_edited} fp8-edited, "
+                f"{stats.dense_edited} dense-edited "
                 f"({total_bytes / 1e9:.1f} GB, {(time.time() - t0) / 60:.1f} min)",
                 flush=True,
             )
@@ -930,7 +1019,8 @@ def abliterate_fp4_to_disk(
         worst = max(rerr.values()) if rerr else 0.0
         print(
             f"\nDone. FP4 model at {dst_dir} ({total_bytes / 1e9:.1f} GB). "
-            f"{stats.fp4_edited} FP4 + {stats.dense_edited} dense tensors edited, "
+            f"{stats.fp4_edited} FP4 + {stats.fp8_edited} FP8 + "
+            f"{stats.dense_edited} dense tensors edited, "
             f"{stats.copied} copied. Worst requant rel-err {worst:.4f}."
         )
     return stats

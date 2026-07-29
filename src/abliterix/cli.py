@@ -696,6 +696,8 @@ def run():
         engine.response_prefix = ""
         engine.needs_reload = False
         engine._dequant_cache = {}
+        engine._dequant_cache_bytes = 0
+        engine._dequant_cache_max_bytes = 4 * 1024**3  # 4 GB
         engine._cached_n_layers = None
         engine._cached_components = None
         engine._is_native_fp8 = False

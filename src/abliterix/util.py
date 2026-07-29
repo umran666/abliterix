@@ -141,14 +141,14 @@ def ask_text(
 
 
 def ask_path(message: str) -> str:
-    if running_in_notebook():
+    if running_in_notebook() or not _stdin_is_tty():
         return ask_text(message)
     else:
         return questionary.path(message, only_directories=True).ask()
 
 
 def ask_secret(message: str) -> str:
-    if running_in_notebook():
+    if running_in_notebook() or not _stdin_is_tty():
         print()
         return getpass.getpass(message)
     else:

@@ -112,6 +112,16 @@ class ModelConfig(BaseModel):
         description="Whether to trust remote code shipped with the model.",
     )
 
+    text_only: bool = Field(
+        default=False,
+        description=(
+            "Force AutoModelForCausalLM even when the checkpoint advertises "
+            "multimodal config fields (e.g. some Qwen3.5-MoE / Agents checkpoints). "
+            "Use for text-only abliteration; leave false to preserve the default "
+            "ImageTextToText path for VLMs."
+        ),
+    )
+
     attn_implementation: str | None = Field(
         default=None,
         description=(

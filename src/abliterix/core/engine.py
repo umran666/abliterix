@@ -111,6 +111,8 @@ _install_mtp_layer_type_validator()
 
 def resolve_model_class(
     model_id: str,
+    *,
+    text_only: bool = False,
 ) -> Type[AutoModelForImageTextToText] | Type[AutoModelForCausalLM]:
     """Choose the correct AutoModel class based on the model's configuration.
 
@@ -118,16 +120,16 @@ def resolve_model_class(
     ``AutoModelForImageTextToText``; their text backbone is accessed via the
     ``model.language_model`` path in ``transformer_layers``.  Pure text models
     use ``AutoModelForCausalLM``.
+
+    When *text_only* is true, always return ``AutoModelForCausalLM`` even if
+    the checkpoint advertises multimodal fields (opt-in for text abliteration
+    of dual-registered MoE VLMs such as some Qwen3.5-MoE checkpoints).
     """
+    if text_only:
+        return AutoModelForCausalLM
+
     configs = PretrainedConfig.get_config_dict(model_id)
     config_dicts = configs if isinstance(configs, tuple) else (configs,)
-    config = config_dicts[0] if isinstance(config_dicts[0], dict) else {}
-
-    # Qwen3.5-MoE / Agents-A1 expose multimodal config fields, but Abliterix
-    # steers only the language model. Loading via ImageTextToText adds vision
-    # plumbing and can break text-only local runs.
-    if isinstance(config, dict) and config.get("model_type") == "qwen3_5_moe":
-        return AutoModelForCausalLM
 
     if any(isinstance(cfg, dict) and "vision_config" in cfg for cfg in config_dicts):
         return AutoModelForImageTextToText
@@ -545,7 +547,9 @@ class SteeringEngine:
                         config.model.experts_implementation
                     )
 
-                self.model = resolve_model_class(model_id).from_pretrained(
+                self.model = resolve_model_class(
+                    model_id, text_only=config.model.text_only
+                ).from_pretrained(
                     model_id,
                     **{_dtype_kwarg: dtype},
                     device_map=config.model.device_map,
@@ -629,12 +633,10 @@ class SteeringEngine:
             raise RuntimeError("Failed to load model with all configured dtypes.")
 
         # bnb 4-bit: non-quantized tensors (embed/norm/lm_head) may still be
-        # float16 when load dtype is float16. Promote them to bf16 so deep
-        # residual norms do not overflow to inf/NaN.
-        if config.model.quant_method == QuantMode.BNB_4BIT and dtype not in (
-            "bfloat16",
-            "auto",
-        ):
+        # float16 after load (including dtype="auto" when the checkpoint is
+        # float16). Promote live float16 params to bf16 for residual dynamic
+        # range. Parameters on meta (accelerate offload) may not retain this.
+        if config.model.quant_method == QuantMode.BNB_4BIT:
             n_conv = 0
             for _n, _p in self.model.named_parameters():
                 if _p.dtype == torch.float16:
@@ -989,11 +991,15 @@ class SteeringEngine:
         """Translate the user-facing QuantMode into a BitsAndBytesConfig."""
         qm = self.config.model.quant_method
         if qm == QuantMode.BNB_4BIT:
-            # Always use bf16 compute for 4-bit. Matching compute_dtype to a
-            # float16 *load* dtype is a common ROCm/MoE footgun: experts may
-            # remain unquantized and blow past RAM, while deep residual norms
-            # also prefer bf16 dynamic range.
-            compute_dtype = torch.bfloat16
+            # Prefer bf16 compute for 4-bit when the device supports it (better
+            # dynamic range for residual norms). Fall back to float16 on older
+            # CUDA/ROCm targets where bf16 is unsupported. This does not choose
+            # which modules are quantized — only the compute dtype for matmuls.
+            compute_dtype = (
+                torch.bfloat16
+                if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+                else torch.float16
+            )
             return BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=compute_dtype,
@@ -1454,7 +1460,9 @@ class SteeringEngine:
         if qconfig is not None:
             extra["quantization_config"] = qconfig
 
-        self.model = resolve_model_class(self.config.model.model_id).from_pretrained(
+        self.model = resolve_model_class(
+            self.config.model.model_id, text_only=self.config.model.text_only
+        ).from_pretrained(
             self.config.model.model_id,
             **{_dtype_kwarg: dtype},
             device_map=self.config.model.device_map,
@@ -1516,7 +1524,9 @@ class SteeringEngine:
             }
 
             print("* Loading base model on CPU (this may take a while)...")
-            base = resolve_model_class(self.config.model.model_id).from_pretrained(
+            base = resolve_model_class(
+                self.config.model.model_id, text_only=self.config.model.text_only
+            ).from_pretrained(
                 self.config.model.model_id,
                 **{_dtype_kwarg: self.model.dtype},
                 device_map="cpu",
@@ -1536,6 +1546,15 @@ class SteeringEngine:
             merged = self.model.merge_and_unload()
             self.needs_reload = True
             return merged
+
+    def _cache_dequant(self, mid: int, weight: Tensor) -> None:
+        """Store a dequantized weight tensor if under the byte budget.
+
+        Pure performance cache: skipping an insert only costs re-dequant time.
+        """
+        if self._dequant_cache_bytes < self._dequant_cache_max_bytes:
+            self._dequant_cache[mid] = weight
+            self._dequant_cache_bytes += weight.nelement() * weight.element_size()
 
     def export_adapter(self, save_directory: str | os.PathLike[str]) -> None:
         """Save the active LoRA adapter without BF16 merge-rounding drift.

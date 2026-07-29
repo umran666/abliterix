@@ -71,7 +71,9 @@ def ask_merge_strategy(config: AbliterixConfig, engine: SteeringEngine) -> str |
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                meta = resolve_model_class(config.model.model_id).from_pretrained(
+                meta = resolve_model_class(
+                    config.model.model_id, text_only=config.model.text_only
+                ).from_pretrained(
                     config.model.model_id,
                     device_map="meta",
                     torch_dtype=torch.bfloat16,
@@ -133,11 +135,14 @@ def _save_lora_adapter_locally(config: AbliterixConfig, engine: SteeringEngine):
     if not save_dir:
         return
 
-    if not hasattr(engine.model, "save_pretrained"):
-        raise RuntimeError("Current model does not support save_pretrained().")
-
     print("Saving LoRA adapter only...")
-    engine.model.save_pretrained(save_dir, safe_serialization=True)
+    try:
+        # Use the guarded export path (rejects non-LoRA, router/expert base
+        # edits, and non-PeftModel backends such as bare vLLM HF shells).
+        engine.export_adapter(save_dir)
+    except RuntimeError as error:
+        print(f"[red]{error}[/]")
+        return
     engine.tokenizer.save_pretrained(save_dir)
     print(f"LoRA adapter saved to [bold]{save_dir}[/].")
     print("[green]Base model weights were not merged or exported.[/]")

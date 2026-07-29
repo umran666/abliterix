@@ -136,6 +136,21 @@ def resolve_model_class(
     return AutoModelForCausalLM
 
 
+def _bf16_compute_supported() -> bool:
+    """True when the active accelerator has native (non-emulated) bf16.
+
+    ``torch.cuda.is_bf16_supported()`` defaults to including software
+    emulation, so pre-Ampere CUDA cards still return True. We only treat
+    ROCm and sm_80+ as native bf16 so older CUDA targets can fall back to
+    float16 for both bnb compute dtype and residual promotion.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if torch.version.hip:  # ROCm: native on supported archs
+        return True
+    return torch.cuda.get_device_capability()[0] >= 8
+
+
 def _register_mtp_layer_types_adapter(
     model_id: str,
     trust_remote_code: bool | None,
@@ -634,9 +649,14 @@ class SteeringEngine:
 
         # bnb 4-bit: non-quantized tensors (embed/norm/lm_head) may still be
         # float16 after load (including dtype="auto" when the checkpoint is
-        # float16). Promote live float16 params to bf16 for residual dynamic
-        # range. Parameters on meta (accelerate offload) may not retain this.
-        if config.model.quant_method == QuantMode.BNB_4BIT:
+        # float16). When native bf16 is available, promote live float16 params
+        # so residual norms match the bf16 compute path. Skip promotion when
+        # we fell back to float16 compute (pre-Ampere CUDA). Parameters on
+        # meta (accelerate offload) may not retain this.
+        if (
+            config.model.quant_method == QuantMode.BNB_4BIT
+            and _bf16_compute_supported()
+        ):
             n_conv = 0
             for _n, _p in self.model.named_parameters():
                 if _p.dtype == torch.float16:
@@ -991,14 +1011,11 @@ class SteeringEngine:
         """Translate the user-facing QuantMode into a BitsAndBytesConfig."""
         qm = self.config.model.quant_method
         if qm == QuantMode.BNB_4BIT:
-            # Prefer bf16 compute for 4-bit when the device supports it (better
-            # dynamic range for residual norms). Fall back to float16 on older
-            # CUDA/ROCm targets where bf16 is unsupported. This does not choose
-            # which modules are quantized — only the compute dtype for matmuls.
+            # Prefer native bf16 compute for residual dynamic range; fall back
+            # to float16 on pre-Ampere CUDA (and CPU). Does not control which
+            # modules are quantized — only matmul compute dtype.
             compute_dtype = (
-                torch.bfloat16
-                if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-                else torch.float16
+                torch.bfloat16 if _bf16_compute_supported() else torch.float16
             )
             return BitsAndBytesConfig(
                 load_in_4bit=True,

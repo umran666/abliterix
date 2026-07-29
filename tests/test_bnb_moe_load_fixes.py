@@ -67,8 +67,7 @@ def test_dequant_cache_default_cap_is_4gib():
 
 def test_build_quant_config_uses_bf16_when_supported(monkeypatch):
     eng = _minimal_bnb_engine()
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    monkeypatch.setattr("abliterix.core.engine._bf16_compute_supported", lambda: True)
     cfg = eng._build_quant_config("float16")
     assert cfg is not None
     assert cfg.bnb_4bit_compute_dtype is torch.bfloat16
@@ -76,8 +75,7 @@ def test_build_quant_config_uses_bf16_when_supported(monkeypatch):
 
 def test_build_quant_config_falls_back_to_fp16_without_bf16(monkeypatch):
     eng = _minimal_bnb_engine()
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    monkeypatch.setattr("abliterix.core.engine._bf16_compute_supported", lambda: False)
     cfg = eng._build_quant_config("float16")
     assert cfg is not None
     assert cfg.bnb_4bit_compute_dtype is torch.float16

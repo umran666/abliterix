@@ -34,7 +34,7 @@ from questionary import Choice
 from rich.traceback import install
 
 from .analysis import ResidualAnalyzer
-from .core.engine import SteeringEngine, load_tokenizer
+from .core.engine import DEQUANT_CACHE_MAX_BYTES, SteeringEngine, load_tokenizer
 from .data import load_prompt_dataset
 from .eval.detector import RefusalDetector
 from .eval.scorer import TrialScorer
@@ -697,7 +697,7 @@ def run():
         engine.needs_reload = False
         engine._dequant_cache = {}
         engine._dequant_cache_bytes = 0
-        engine._dequant_cache_max_bytes = 4 * 1024**3  # 4 GB
+        engine._dequant_cache_max_bytes = DEQUANT_CACHE_MAX_BYTES
         engine._cached_n_layers = None
         engine._cached_components = None
         engine._is_native_fp8 = False

@@ -116,6 +116,12 @@ def ask_choice(message: str, choices: list[Any]) -> Any:
                 print(f"[red]Please enter a number between 1 and {len(real)}[/]")
             except ValueError:
                 print("[red]Invalid input. Please enter a number.[/]")
+            except (KeyboardInterrupt, EOFError):
+                # questionary's .ask() returns None when the user aborts;
+                # callers treat that as "go back one menu". Match it here so
+                # a redirected stdout does not turn Ctrl-C into a hard exit.
+                print()
+                return None
     else:
         return questionary.select(
             message,
@@ -133,7 +139,16 @@ def ask_text(
     if running_in_notebook() or not _stdin_is_tty():
         print()
         prompt = f"{message} [{default}]: " if default else f"{message}: "
-        result = input(prompt)
+        try:
+            result = input(prompt)
+        except (KeyboardInterrupt, EOFError):
+            # `unsafe=True` callers (the chat loop) expect the interrupt to
+            # propagate, exactly like questionary's unsafe_ask(); everyone
+            # else expects the None that .ask() returns on abort.
+            if unsafe:
+                raise
+            print()
+            return None  # ty:ignore[invalid-return-type]
         return result if result else default
     else:
         q = questionary.text(message, default=default, qmark=qmark)
@@ -150,7 +165,11 @@ def ask_path(message: str) -> str:
 def ask_secret(message: str) -> str:
     if running_in_notebook() or not _stdin_is_tty():
         print()
-        return getpass.getpass(message)
+        try:
+            return getpass.getpass(message)
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return None  # ty:ignore[invalid-return-type]
     else:
         return questionary.password(message).ask()
 

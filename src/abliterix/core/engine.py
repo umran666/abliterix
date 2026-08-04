@@ -109,6 +109,12 @@ def _install_mtp_layer_type_validator() -> None:
 _install_mtp_layer_type_validator()
 
 
+# Cap the dequantised-weight cache so large MoE expert counts cannot retain
+# hundreds of GB of fp32 copies in RAM.  Shared by SteeringEngine.__init__ and
+# the fast vLLM engine shell in cli.py so the two cannot drift apart.
+DEQUANT_CACHE_MAX_BYTES = 4 * 1024**3  # 4 GiB
+
+
 def resolve_model_class(
     model_id: str,
     *,
@@ -380,7 +386,7 @@ class SteeringEngine:
         self._dequant_cache_bytes: int = 0
         # Cap dequant cache so large MoE expert counts cannot retain
         # hundreds of GB of fp32 weights in RAM.
-        self._dequant_cache_max_bytes: int = 4 * 1024**3  # 4 GB
+        self._dequant_cache_max_bytes: int = DEQUANT_CACHE_MAX_BYTES
 
         # Cached metadata — populated by prepare_for_unload() before the HF
         # model is freed, so the optimizer can still query layer/component
@@ -520,7 +526,7 @@ class SteeringEngine:
             print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
 
             try:
-                qconfig = self._build_quant_config(dtype)
+                qconfig = self._build_quant_config()
 
                 extra: dict[str, Any] = {}
                 if qconfig is not None:
@@ -1007,7 +1013,7 @@ class SteeringEngine:
         except Exception:
             pass  # Best-effort; if this fails, the original error will surface.
 
-    def _build_quant_config(self, dtype: str) -> BitsAndBytesConfig | None:
+    def _build_quant_config(self) -> BitsAndBytesConfig | None:
         """Translate the user-facing QuantMode into a BitsAndBytesConfig."""
         qm = self.config.model.quant_method
         if qm == QuantMode.BNB_4BIT:
@@ -1472,7 +1478,7 @@ class SteeringEngine:
         self.model = None  # ty:ignore[invalid-assignment]
         flush_memory()
 
-        qconfig = self._build_quant_config(str(dtype).split(".")[-1])
+        qconfig = self._build_quant_config()
         extra: dict[str, Any] = {}
         if qconfig is not None:
             extra["quantization_config"] = qconfig
@@ -1596,6 +1602,21 @@ class SteeringEngine:
             )
         if not isinstance(self.model, PeftModel):
             raise RuntimeError("No active PEFT LoRA adapter is available to export.")
+        # `export_merged()` calls `merge_and_unload()` in place on the
+        # unquantized path: the LoRA layers are folded into the base weights
+        # and removed, but `self.model` stays a PeftModel object.  The
+        # isinstance check above therefore still passes and PEFT would happily
+        # write a zero-tensor adapter.  `needs_reload` is the engine's
+        # canonical "weights were destructively mutated" flag; the state-dict
+        # check also covers any other route to an emptied adapter.
+        if self.needs_reload or not any(
+            "lora_" in name for name, _ in self.model.named_parameters()
+        ):
+            raise RuntimeError(
+                "The in-memory LoRA adapter was consumed by a previous merged "
+                "export. Re-select the trial to reload the base model before "
+                "exporting an adapter."
+            )
 
         self.model.save_pretrained(save_directory)
 

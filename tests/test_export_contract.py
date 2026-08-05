@@ -84,6 +84,9 @@ def test_export_adapter_saves_active_peft_state_without_merging(monkeypatch, tmp
         def __init__(self):
             self.saved_to = None
 
+        def named_parameters(self):
+            yield "base_model.model.layers.0.o_proj.lora_A.default.weight", object()
+
         def save_pretrained(self, path):
             self.saved_to = path
 
@@ -93,6 +96,7 @@ def test_export_adapter_saves_active_peft_state_without_merging(monkeypatch, tmp
         steering=SimpleNamespace(steering_mode=SteeringMode.LORA),
     )
     engine.model = FakePeftModel()
+    engine.needs_reload = False
     engine._router_originals = []
     engine._expert_deltas = []
 

@@ -1,0 +1,57 @@
+# Pinned, CPU-sized end-to-end fixture for independent reproducibility checks.
+
+non_interactive = true
+overwrite_checkpoint = true
+seed = 12345
+
+[model]
+model_id = "tiny-random/qwen2.5"
+revision = "7a6a3128ee4137a248d6d1582824592b87a81647"
+dtype_fallback_order = ["float32"]
+device_map = "cpu"
+
+[inference]
+batch_size = 2
+max_batch_size = 2
+max_gen_tokens = 10
+
+[steering]
+orthogonal_projection = true
+weight_normalization = "full"
+strength_range = [0.8, 0.8]
+
+[optimization]
+num_trials = 2
+num_warmup_trials = 1
+sampler_seed = 12345
+
+[kl]
+token_count = 1
+prune_threshold = 0.0
+
+[detection]
+llm_judge = false
+
+[benign_prompts]
+dataset = "mlabonne/harmless_alpaca"
+revision = "02c6a92cfcf11bb0c387334f8146d149d65b587f"
+split = "train[:5]"
+column = "text"
+
+[target_prompts]
+dataset = "mlabonne/harmful_behaviors"
+revision = "01cead01398926d81f7c52bdb790ee8cf77ebba7"
+split = "train[:5]"
+column = "text"
+
+[benign_eval_prompts]
+dataset = "mlabonne/harmless_alpaca"
+revision = "02c6a92cfcf11bb0c387334f8146d149d65b587f"
+split = "test[:5]"
+column = "text"
+
+[target_eval_prompts]
+dataset = "mlabonne/harmful_behaviors"
+revision = "01cead01398926d81f7c52bdb790ee8cf77ebba7"
+split = "test[:5]"
+column = "text"

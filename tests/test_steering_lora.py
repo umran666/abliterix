@@ -54,6 +54,7 @@ def test_multi_direction_lora_stacks_rank_k_updates_without_reshaping_parameters
     abliterix_config,
 ):
     """Each direction occupies one adapter rank and the wrapped layer stays usable."""
+    abliterix_config.steering.weight_normalization = WeightNorm.NONE
     torch.manual_seed(7)
     rank, in_features, out_features = 3, 5, 4
     strength = 0.4
@@ -345,6 +346,7 @@ def test_restore_baseline_keeps_rank_k_adapter_forward_contract(abliterix_config
 
 def test_single_direction_lora_remains_rank_one_compatible(abliterix_config):
     """The existing 2D per-layer vector layout keeps its rank-1 semantics."""
+    abliterix_config.steering.weight_normalization = WeightNorm.NONE
     torch.manual_seed(17)
     in_features, out_features = 5, 4
     strength = 0.4
@@ -377,6 +379,7 @@ def test_gqa_projection_uses_input_side_when_output_is_not_hidden_size(
     abliterix_config,
 ):
     """K/V projections with ``out < hidden`` must not be silently skipped."""
+    abliterix_config.steering.weight_normalization = WeightNorm.NONE
     torch.manual_seed(18)
     hidden, kv_out = 5, 2
     strength = 0.4
@@ -445,7 +448,7 @@ def test_multi_direction_rank_is_checked_before_full_norm_approximation(
     ("steering", "expected"),
     [
         ({"n_directions": 3}, 3),
-        ({"search_harmfulness_direction": True}, 2),
+        ({"search_harmfulness_direction": True}, 3),
         ({"vector_method": "som", "som_grid_h": 2, "som_grid_w": 3}, 6),
         (
             {

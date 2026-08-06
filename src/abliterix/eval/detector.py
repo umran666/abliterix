@@ -49,6 +49,19 @@ def _resolve_judge_api_key(config: AbliterixConfig) -> str:
     return "".join(os.environ.get(_judge_api_key_env(config), "").split())
 
 
+def validate_judge_credentials(config: AbliterixConfig) -> None:
+    """Fail before model loading when the configured external judge cannot run."""
+    if not config.detection.llm_judge:
+        return
+    env_var = _judge_api_key_env(config)
+    if not _resolve_judge_api_key(config):
+        raise RuntimeError(
+            f"LLM judge is enabled but {env_var} is not set. Set the key before "
+            "starting the run, or set detection.llm_judge=false for the "
+            "deterministic built-in evaluator."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Persistent classification cache (sqlite3, thread-safe)
 # ---------------------------------------------------------------------------

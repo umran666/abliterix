@@ -77,6 +77,7 @@ class SGLangGenerator:
 
         kwargs: dict[str, Any] = dict(
             model_path=model_id,
+            revision=config.model.revision,
             tp_size=tp,
             mem_fraction_static=config.model.gpu_memory_utilization,
             trust_remote_code=trust,
@@ -109,7 +110,9 @@ class SGLangGenerator:
                 from transformers import AutoConfig
 
                 _auto_cfg = AutoConfig.from_pretrained(
-                    model_id, trust_remote_code=trust
+                    model_id,
+                    trust_remote_code=trust,
+                    revision=config.model.revision,
                 )
                 _qcfg = getattr(_auto_cfg, "quantization_config", None)
                 if _qcfg is None:

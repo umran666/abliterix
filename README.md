@@ -71,7 +71,7 @@ Abliterix modifies model internals rather than relying on prompt-level jailbreak
 For each layer, let $g$ be the mean activation for benign prompts and $b$ the mean activation for target prompts. The simplest refusal direction is:
 
 $$
-r = \operatorname{normalize}(b-g)
+r = \frac{b-g}{\lVert b-g \rVert_2}
 $$
 
 Abliteration removes weight components aligned with this direction. A simplified input-side transformation is:

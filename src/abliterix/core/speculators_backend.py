@@ -64,6 +64,7 @@ def extract_hidden_states_speculators(
     model_config = AutoConfig.from_pretrained(
         model_id,
         trust_remote_code=True,
+        revision=config.model.revision,
     )
     num_layers = model_config.num_hidden_layers
     layer_ids = list(range(num_layers))
@@ -84,6 +85,7 @@ def extract_hidden_states_speculators(
     tokenizer = AutoTokenizer.from_pretrained(
         model_id,
         trust_remote_code=True,
+        revision=config.model.revision,
     )
 
     token_ids_list: list[list[int]] = []

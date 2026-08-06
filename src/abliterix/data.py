@@ -50,7 +50,7 @@ def load_prompt_dataset(
                 download_mode=DownloadMode.FORCE_REDOWNLOAD,
             )
     else:
-        dataset = load_dataset(path, split=split_expr)
+        dataset = load_dataset(path, split=split_expr, revision=source.revision)
 
     texts = list(dataset[source.column])
 

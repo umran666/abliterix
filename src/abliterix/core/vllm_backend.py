@@ -195,7 +195,11 @@ def _resolve_expert_parallel(
     return configured
 
 
-def _detect_model_metadata(model_id: str, trust_remote_code: bool) -> tuple[str, bool]:
+def _detect_model_metadata(
+    model_id: str,
+    trust_remote_code: bool,
+    revision: str | None = None,
+) -> tuple[str, bool]:
     """Return ``(architecture, is_moe)`` from the model's HF config.
 
     A failure here means MLA-aware backend selection silently degrades to
@@ -206,7 +210,11 @@ def _detect_model_metadata(model_id: str, trust_remote_code: bool) -> tuple[str,
     try:
         from transformers import AutoConfig
 
-        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+        cfg = AutoConfig.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+        )
     except Exception as exc:
         print(
             "  [yellow]Warning: could not load HF config for arch detection "
@@ -221,9 +229,13 @@ def _detect_model_metadata(model_id: str, trust_remote_code: bool) -> tuple[str,
     return model_arch, _config_looks_moe(cfg, model_arch)
 
 
-def _detect_arch_family(model_id: str, trust_remote_code: bool) -> str:
+def _detect_arch_family(
+    model_id: str,
+    trust_remote_code: bool,
+    revision: str | None = None,
+) -> str:
     """Backward-compatible architecture-only view of model metadata."""
-    model_arch, _ = _detect_model_metadata(model_id, trust_remote_code)
+    model_arch, _ = _detect_model_metadata(model_id, trust_remote_code, revision)
     return model_arch
 
 
@@ -270,7 +282,9 @@ def _detect_fp8_and_kv_dtype(
             from transformers import AutoConfig
 
             _auto_cfg = AutoConfig.from_pretrained(
-                model_id, trust_remote_code=trust_remote_code
+                model_id,
+                trust_remote_code=trust_remote_code,
+                revision=config.model.revision,
             )
             _qcfg = getattr(_auto_cfg, "quantization_config", None)
             if _qcfg is None:
@@ -326,6 +340,7 @@ def _build_llm_kwargs(
 
     kwargs: dict[str, Any] = dict(
         model=config.model.model_id,
+        revision=config.model.revision,
         tensor_parallel_size=tp,
         gpu_memory_utilization=config.model.gpu_memory_utilization,
         trust_remote_code=config.model.trust_remote_code or False,
@@ -499,7 +514,9 @@ class VLLMGenerator:
 
         # Architecture sniff drives the MLA-aware attention backend choice
         # below. Cached so we only hit the HF config once.
-        model_arch, is_moe = _detect_model_metadata(model_id, trust)
+        model_arch, is_moe = _detect_model_metadata(
+            model_id, trust, config.model.revision
+        )
 
         print(f"* Loading model in vLLM with TP={tp}...")
 
@@ -531,7 +548,7 @@ class VLLMGenerator:
 
         self.llm = LLM(**kwargs)
         self.tokenizer = self.llm.get_tokenizer()
-        self._ensure_chat_template(model_id, trust)
+        self._ensure_chat_template(model_id, trust, config.model.revision)
 
         # Adapter management — use tmpfs (/dev/shm) to avoid disk I/O overhead
         # during per-trial LoRA hot-swap.  Falls back to /tmp if /dev/shm is
@@ -738,7 +755,12 @@ class VLLMGenerator:
     # Chat template formatting
     # ------------------------------------------------------------------
 
-    def _ensure_chat_template(self, model_id: str, trust_remote_code: bool) -> None:
+    def _ensure_chat_template(
+        self,
+        model_id: str,
+        trust_remote_code: bool,
+        revision: str | None = None,
+    ) -> None:
         """Copy the HF chat template when vLLM's tokenizer wrapper omits it."""
         if getattr(self.tokenizer, "chat_template", None):
             return
@@ -748,6 +770,7 @@ class VLLMGenerator:
             hf_tokenizer = AutoTokenizer.from_pretrained(
                 model_id,
                 trust_remote_code=trust_remote_code,
+                revision=revision,
             )
         except Exception:
             return

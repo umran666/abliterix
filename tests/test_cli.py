@@ -41,7 +41,7 @@ def test_positional_model_id():
 
         # Replicate positional-arg inference from cli.run()
         if (
-            len(sys.argv) > 1
+            len(sys.argv) == 2
             and "--model.model-id" not in sys.argv
             and not sys.argv[-1].startswith("-")
         ):
@@ -53,6 +53,17 @@ def test_positional_model_id():
         assert config.model.model_id == "org/positional-model"
     finally:
         sys.argv = old_argv
+
+
+def test_final_option_value_is_not_reinterpreted_as_model_id():
+    argv = ["test", "--config", "recipe.toml"]
+    if (
+        len(argv) == 2
+        and "--model.model-id" not in argv
+        and not argv[-1].startswith("-")
+    ):
+        argv.insert(-1, "--model.model-id")
+    assert argv == ["test", "--config", "recipe.toml"]
 
 
 # ---------------------------------------------------------------------------

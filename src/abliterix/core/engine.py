@@ -111,6 +111,7 @@ _install_mtp_layer_type_validator()
 
 def resolve_model_class(
     model_id: str,
+    revision: str | None = None,
 ) -> Type[AutoModelForImageTextToText] | Type[AutoModelForCausalLM]:
     """Choose the correct AutoModel class based on the model's configuration.
 
@@ -119,7 +120,7 @@ def resolve_model_class(
     ``model.language_model`` path in ``transformer_layers``.  Pure text models
     use ``AutoModelForCausalLM``.
     """
-    configs = PretrainedConfig.get_config_dict(model_id)
+    configs = PretrainedConfig.get_config_dict(model_id, revision=revision)
     if any("vision_config" in cfg for cfg in configs):
         return AutoModelForImageTextToText
     return AutoModelForCausalLM
@@ -128,6 +129,7 @@ def resolve_model_class(
 def _register_mtp_layer_types_adapter(
     model_id: str,
     trust_remote_code: bool | None,
+    revision: str | None = None,
 ) -> None:
     """Register models whose ``layer_types`` includes MTP head layers.
 
@@ -144,6 +146,7 @@ def _register_mtp_layer_types_adapter(
         cfgs = PretrainedConfig.get_config_dict(
             model_id,
             trust_remote_code=trust_remote_code,
+            revision=revision,
         )
         cfg_dict = cfgs[0] if isinstance(cfgs, tuple) else cfgs
         layer_types = cfg_dict.get("layer_types")
@@ -166,11 +169,13 @@ def _register_mtp_layer_types_adapter(
 def load_tokenizer(
     model_id: str,
     trust_remote_code: bool | None = None,
+    revision: str | None = None,
 ) -> PreTrainedTokenizerBase:
     try:
         return AutoTokenizer.from_pretrained(
             model_id,
             trust_remote_code=trust_remote_code,
+            revision=revision,
         )
     except AttributeError as exc:
         if "'list' object has no attribute 'keys'" not in str(exc):
@@ -179,14 +184,15 @@ def load_tokenizer(
         return AutoTokenizer.from_pretrained(
             model_id,
             trust_remote_code=trust_remote_code,
+            revision=revision,
             extra_special_tokens={},
         )
     except ValueError as exc:
         if "TokenizersBackend" not in str(exc):
             raise
 
-        cfg_path = hf_hub_download(model_id, "tokenizer_config.json")
-        tok_path = hf_hub_download(model_id, "tokenizer.json")
+        cfg_path = hf_hub_download(model_id, "tokenizer_config.json", revision=revision)
+        tok_path = hf_hub_download(model_id, "tokenizer.json", revision=revision)
         with open(cfg_path, encoding="utf-8") as f:
             cfg = json.load(f)
 
@@ -368,11 +374,13 @@ class SteeringEngine:
         _register_mtp_layer_types_adapter(
             model_id,
             config.model.trust_remote_code,
+            config.model.revision,
         )
 
         self.tokenizer = load_tokenizer(
             model_id,
             trust_remote_code=config.model.trust_remote_code,
+            revision=config.model.revision,
         )
 
         # Tokenizers that lack a dedicated pad token fall back to EOS.
@@ -421,7 +429,11 @@ class SteeringEngine:
         try:
             from transformers import AutoConfig as _AC
 
-            _auto_cfg = _AC.from_pretrained(model_id, trust_remote_code=True)
+            _auto_cfg = _AC.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                revision=config.model.revision,
+            )
             _qcfg = getattr(_auto_cfg, "quantization_config", None)
             if _qcfg is None:
                 _text_cfg = getattr(_auto_cfg, "text_config", None)
@@ -484,7 +496,7 @@ class SteeringEngine:
         # AttributeError during replace_with_fp8_linear. Patch the config class
         # to alias intermediate_size → moe_intermediate_size if needed.
         if is_fp8:
-            self._patch_moe_config_for_fp8(model_id)
+            self._patch_moe_config_for_fp8(model_id, config.model.revision)
 
         for dtype in config.model.dtype_fallback_order:
             print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
@@ -532,12 +544,15 @@ class SteeringEngine:
                         config.model.experts_implementation
                     )
 
-                self.model = resolve_model_class(model_id).from_pretrained(
+                self.model = resolve_model_class(
+                    model_id, config.model.revision
+                ).from_pretrained(
                     model_id,
                     **{_dtype_kwarg: dtype},
                     device_map=config.model.device_map,
                     max_memory=self.max_memory,
                     trust_remote_code=self.trusted_models.get(model_id),
+                    revision=config.model.revision,
                     offload_folder="/tmp/offload",
                     **extra,
                 )
@@ -925,7 +940,7 @@ class SteeringEngine:
         )
 
     @staticmethod
-    def _patch_moe_config_for_fp8(model_id: str) -> None:
+    def _patch_moe_config_for_fp8(model_id: str, revision: str | None = None) -> None:
         """Patch MoE config classes that lack ``intermediate_size``.
 
         The transformers FP8 quantizer (``finegrained_fp8.py``) falls back to
@@ -940,7 +955,9 @@ class SteeringEngine:
         from transformers import AutoConfig
 
         try:
-            auto_cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+            auto_cfg = AutoConfig.from_pretrained(
+                model_id, trust_remote_code=True, revision=revision
+            )
             text_cfg = getattr(auto_cfg, "text_config", auto_cfg)
             cfg_cls = type(text_cfg)
 
@@ -1421,12 +1438,15 @@ class SteeringEngine:
         if qconfig is not None:
             extra["quantization_config"] = qconfig
 
-        self.model = resolve_model_class(self.config.model.model_id).from_pretrained(
+        self.model = resolve_model_class(
+            self.config.model.model_id, self.config.model.revision
+        ).from_pretrained(
             self.config.model.model_id,
             **{_dtype_kwarg: dtype},
             device_map=self.config.model.device_map,
             max_memory=self.max_memory,
             trust_remote_code=self.trusted_models.get(self.config.model.model_id),
+            revision=self.config.model.revision,
             **extra,
         )
         if self.config.model.quant_method == QuantMode.FP8 or self._is_native_fp8:
@@ -1483,11 +1503,14 @@ class SteeringEngine:
             }
 
             print("* Loading base model on CPU (this may take a while)...")
-            base = resolve_model_class(self.config.model.model_id).from_pretrained(
+            base = resolve_model_class(
+                self.config.model.model_id, self.config.model.revision
+            ).from_pretrained(
                 self.config.model.model_id,
                 **{_dtype_kwarg: self.model.dtype},
                 device_map="cpu",
                 trust_remote_code=self.trusted_models.get(self.config.model.model_id),
+                revision=self.config.model.revision,
             )
 
             print("* Applying LoRA adapters...")

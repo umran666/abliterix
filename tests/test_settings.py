@@ -26,11 +26,13 @@ from abliterix.types import DecayKernel, QuantMode, VectorMethod, WeightNorm
 
 def test_model_config_defaults():
     cfg = ModelConfig(model_id="test/model")
+    assert cfg.revision is None
     assert cfg.quant_method == QuantMode.NONE
     assert cfg.device_map == "auto"
     assert cfg.use_torch_compile is False
     assert cfg.max_memory is None
     assert cfg.evaluate_model_id is None
+    assert cfg.evaluate_model_revision is None
 
 
 def test_inference_config_defaults():
@@ -44,9 +46,9 @@ def test_inference_config_defaults():
 def test_steering_config_defaults():
     cfg = SteeringConfig()
     assert cfg.vector_method == VectorMethod.MEAN
-    assert cfg.orthogonal_projection is False
+    assert cfg.orthogonal_projection is True
     assert cfg.decay_kernel == DecayKernel.LINEAR
-    assert cfg.weight_normalization == WeightNorm.NONE
+    assert cfg.weight_normalization == WeightNorm.FULL
     assert cfg.outlier_quantile == 1.0
 
 
@@ -68,9 +70,10 @@ def test_kl_config_defaults():
 
 def test_detection_config_defaults():
     cfg = DetectionConfig()
-    assert cfg.llm_judge is True
+    assert cfg.llm_judge is False
     assert len(cfg.compliance_markers) > 0
     assert "sorry" in cfg.compliance_markers
+    assert "disclaimer" in cfg.compliance_markers
 
 
 def test_display_config_defaults():
@@ -114,6 +117,11 @@ def test_abliterix_config_data_sources():
     assert config.target_prompts.dataset
     assert config.benign_eval_prompts.dataset
     assert config.target_eval_prompts.dataset
+
+
+def test_vllm_uses_strongest_supported_implicit_normalization():
+    config = AbliterixConfig(model={"model_id": "test/model", "backend": "vllm"})
+    assert config.steering.weight_normalization == WeightNorm.PRE
 
 
 # ---------------------------------------------------------------------------

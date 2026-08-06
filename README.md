@@ -64,19 +64,23 @@ That's it. The process is fully automatic — after optimization completes, you 
 
 Abliterix modifies model internals rather than relying on prompt-level jailbreaks. Its basic assumption is that benign prompts and prompts that trigger refusal produce measurably different activation patterns in the model's residual stream.
 
-For each layer, let \(g\) be the mean activation for benign prompts and \(b\) the mean activation for target prompts. The simplest refusal direction is:
+<p align="center">
+  <img src="assets/how-it-works.svg" alt="How Abliterix extracts activations, derives a refusal direction, projects it out of model weights, and optimizes the refusal-versus-drift trade-off" width="100%">
+</p>
 
-\[
+For each layer, let $g$ be the mean activation for benign prompts and $b$ the mean activation for target prompts. The simplest refusal direction is:
+
+$$
 r = \operatorname{normalize}(b-g)
-\]
+$$
 
 Abliteration removes weight components aligned with this direction. A simplified input-side transformation is:
 
-\[
+$$
 W' = W-\alpha(Wr)r^\top
-\]
+$$
 
-where \(\alpha\) controls the intervention strength. In practice, Abliterix can apply the corresponding projection on either side of a weight matrix, depending on whether a module reads from or writes to the residual stream.
+where $\alpha$ controls the intervention strength. In practice, Abliterix can apply the corresponding projection on either side of a weight matrix, depending on whether a module reads from or writes to the residual stream.
 
 The automated pipeline is:
 

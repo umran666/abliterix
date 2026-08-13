@@ -45,6 +45,26 @@ import transformers as _tf
 _dtype_kwarg = "dtype" if int(_tf.__version__.split(".")[0]) >= 5 else "torch_dtype"
 
 
+def extract_router_expert_ids(out: Any, top_k: int = 8) -> Tensor:
+    """Return the top-k expert-id tensor from a MoE router forward.
+
+    Router tuple order is family-specific. Bailing MoE v3 returns
+    ``(topk_idx, topk_weight, logits)`` — indices first — while several
+    other families put indices last. Prefer the first integer tensor
+    instead of a fixed ``out[2]`` slot.
+    """
+    if isinstance(out, tuple) and len(out) >= 3:
+        for cand in out:
+            if isinstance(cand, Tensor) and cand.dtype in (torch.int32, torch.int64):
+                return cand
+        return out[0] if isinstance(out[0], Tensor) else out[1]
+    if isinstance(out, tuple) and len(out) == 2:
+        return out[1]
+    logits = out if not isinstance(out, tuple) else out[0]
+    _, selected = logits.topk(top_k, dim=-1)
+    return selected
+
+
 # Models registered here have a known remote-config mismatch where MTP heads
 # are appended to ``layer_types`` even though ``num_hidden_layers`` describes
 # decoder layers only.  The registry is populated from the model's own
@@ -1329,14 +1349,9 @@ class SteeringEngine:
         def _make_hook(layer_idx: int):
             def hook(module: Module, inp: Any, out: Any):
                 with torch.no_grad():
-                    if isinstance(out, tuple) and len(out) >= 3:
-                        selected = out[2]
-                    elif isinstance(out, tuple) and len(out) == 2:
-                        selected = out[1]
-                    else:
-                        logits = out if not isinstance(out, tuple) else out[0]
-                        k = getattr(module, "top_k", 8)
-                        _, selected = logits.topk(k, dim=-1)
+                    selected = extract_router_expert_ids(
+                        out, top_k=getattr(module, "top_k", 8)
+                    )
 
                     flat = selected.reshape(-1)
                     k = getattr(module, "top_k", selected.shape[-1])
@@ -1344,8 +1359,20 @@ class SteeringEngine:
 
                     active_tokens[0][layer_idx] += n_tok
                     cnts = active_counts[0][layer_idx]
-                    for eid in flat.unique().tolist():
-                        cnts[eid] += int((flat == eid).sum().item())
+                    # One bincount instead of per-expert (flat == eid) GPU
+                    # syncs — the loop is catastrophically slow on 512-expert
+                    # MoEs (hours vs minutes).
+                    weight = getattr(module, "weight", None)
+                    n_experts = (
+                        weight.shape[0]
+                        if weight is not None
+                        else int(flat.max().item()) + 1
+                    )
+                    for eid, count in enumerate(
+                        torch.bincount(flat.long(), minlength=n_experts).cpu().tolist()
+                    ):
+                        if count:
+                            cnts[eid] += count
 
             return hook
 

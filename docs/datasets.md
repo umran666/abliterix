@@ -26,8 +26,6 @@ The 500-example sets run ~2x faster than the 1000 sets with no clear quality los
 
 Generation uses a hard policy floor: no minors in any unsafe/sexual/violent role, no real identifiable individuals, and sexual content kept non-graphic. The generator also rejects provider refusal boilerplate, unsafe prompts that mention minors, and duplicate outputs before writing a row. Category counts aren't perfectly uniform — Gemini's own safety filter blocks some categories (notably CBRNE) far more than others regardless of the research framing.
 
-> **Regeneration required:** the currently published `video_bad_1000` snapshot predates these post-generation validation gates. An August 2026 audit found 22 provider-refusal rows and one unsafe prompt mentioning a minor; regenerate and republish that split with the current script before using it as a strict safety benchmark.
-
 ## Why we built our own datasets
 
 Public abliteration benchmarks (e.g. `mlabonne/harmful_behaviors`, `mlabonne/harmless_alpaca`) are widely used but have critical limitations:

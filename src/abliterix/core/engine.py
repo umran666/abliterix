@@ -1110,6 +1110,26 @@ class SteeringEngine:
         with suppress(Exception):
             _register("attn.o_proj", layer.linear_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
 
+        # Bailing MoE v3 hybrid (Ling-3.0-flash, inclusionAI): decoder blocks
+        # expose attention under ``layer.attention`` (not ``self_attn``).
+        # Layers alternate MultiLatentAttention (output proj = ``dense``) and
+        # KimiDeltaAttention (output proj = ``o_proj``). Without these paths
+        # only ``mlp.down_proj`` is steerable.
+        with suppress(Exception):
+            _register("attn.o_proj", layer.attention.o_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.o_proj", layer.attention.dense)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.q_proj", layer.attention.q_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.k_proj", layer.attention.k_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.v_proj", layer.attention.v_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.q_b_proj", layer.attention.q_b_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.kv_b_proj", layer.attention.kv_b_proj)  # ty:ignore[possibly-missing-attribute]
+
         # Dense-model MLP down-projection.
         with suppress(Exception):
             _register("mlp.down_proj", layer.mlp.down_proj)  # ty:ignore[possibly-missing-attribute]

@@ -44,6 +44,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -385,6 +386,66 @@ def build_bad_tasks(count: int) -> list[dict]:
 # workers all retry into the same saturated window at once.
 RATE_LIMIT_RPM = 150
 
+# Providers sometimes return a policy refusal inside an otherwise valid JSON
+# object.  Such rows are unusable as target concepts and can also collapse to
+# identical boilerplate, so reject them before they reach the progress file.
+REFUSAL_RE = re.compile(
+    r"\b(?:i cannot|i can't|i am unable|i’m unable|cannot assist|can't assist|"
+    r"cannot generate|can't generate|cannot create|can't create|cannot comply|"
+    r"must refuse|unable to provide|sorry,? but)\b|"
+    r"无法(?:生成|提供|协助)|不能(?:生成|提供|协助)|抱歉",
+    re.IGNORECASE,
+)
+
+# The unsafe split has an absolute no-minors contract.  A conservative lexical
+# gate is preferable to silently accepting a violating row; false positives are
+# simply regenerated during the normal backfill rounds.
+MINOR_RE = re.compile(
+    r"\b(?:child(?:ren)?|kid(?:s)?|minor(?:s)?|teen(?:s|ager|agers|age)?|"
+    r"underage|youngster(?:s)?|schoolboy(?:s)?|schoolgirl(?:s)?|"
+    r"boy(?:s)?|girl(?:s)?|baby|babies|toddler(?:s)?)\b|"
+    r"儿童|孩子|小孩|未成年|少年|少女|男孩|女孩|婴儿|幼儿",
+    re.IGNORECASE,
+)
+
+
+def normalize_prompt(prompt: str) -> str:
+    """Return a stable key for cross-batch and resume-time deduplication."""
+    return " ".join(prompt.split()).casefold()
+
+
+def validate_prompt_text(prompt: object, kind: str) -> str:
+    """Validate provider text before accepting it into a generated split."""
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("Generated prompt is empty or not a string")
+    prompt = prompt.strip()
+    if REFUSAL_RE.search(prompt):
+        raise ValueError("Provider returned a refusal instead of a T2V prompt")
+    if kind == "bad" and MINOR_RE.search(prompt):
+        raise ValueError("Unsafe prompt mentions a minor")
+    return prompt
+
+
+def sanitize_entries(entries: list[dict], kind: str) -> tuple[list[dict], int]:
+    """Drop invalid and duplicate rows loaded from a progress file."""
+    clean: list[dict] = []
+    seen: set[str] = set()
+    dropped = 0
+    for entry in entries:
+        try:
+            prompt = validate_prompt_text(entry.get("prompt"), kind)
+        except ValueError:
+            dropped += 1
+            continue
+        key = normalize_prompt(prompt)
+        if key in seen:
+            dropped += 1
+            continue
+        entry["prompt"] = prompt
+        seen.add(key)
+        clean.append(entry)
+    return clean, dropped
+
 
 class RateLimiter:
     """Paces call starts to at most `rate_per_minute`, evenly spaced."""
@@ -494,6 +555,7 @@ async def generate_one(
                 raise ValueError("Empty response")
 
             result = json.loads(content)
+            prompt = validate_prompt_text(result.get("prompt"), kind)
 
             if kind == "good_matched":
                 source = "generated_benign_video"
@@ -524,7 +586,7 @@ async def generate_one(
 
             entry = {
                 "id": 0,  # filled later
-                "prompt": result["prompt"],
+                "prompt": prompt,
                 "source": source,
                 "category": category,
                 "language": language,
@@ -539,7 +601,19 @@ async def generate_one(
             return entry
 
         except Exception as e:
-            is_rate_limit = "429" in str(e) or "rate limit" in str(e).lower()
+            status_code = getattr(e, "status_code", None)
+            is_rate_limit = (
+                status_code == 429
+                or "429" in str(e)
+                or "rate limit" in str(e).lower()
+            )
+            if (
+                isinstance(status_code, int)
+                and 400 <= status_code < 500
+                and not is_rate_limit
+            ):
+                print(f"  FAILED with non-retryable HTTP {status_code}: {e}")
+                return None
             if attempt < max_retries - 1:
                 if is_rate_limit:
                     # Shared-capacity throttling, not a permanent block —
@@ -578,6 +652,15 @@ def append_progress(path: Path, entry: dict) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def write_progress(path: Path, entries: list[dict]) -> None:
+    """Atomically replace a progress file after resume-time sanitization."""
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    tmp_path.replace(path)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -600,6 +683,10 @@ async def generate_dataset(
     rejections with fresh random task draws until target_count is reached (or
     max_backfill_rounds is exhausted)."""
     results: list[dict] = load_progress(progress_path) if resume else []
+    results, dropped = sanitize_entries(results, label)
+    if resume and dropped:
+        print(f"  Dropped {dropped} invalid or duplicate progress rows")
+        write_progress(progress_path, results)
     if not resume and progress_path.exists():
         progress_path.unlink()
 
@@ -623,12 +710,22 @@ async def generate_dataset(
                 print(
                     f"  [{label}] {base + completed}/{target_count} (batch {completed}/{total})"
                 )
-            if result:
-                append_progress(progress_path, result)
             return result
 
         batch_results = await asyncio.gather(*[process_task(t) for t in tasks])
-        return [r for r in batch_results if r is not None]
+        unique_results: list[dict] = []
+        seen = {normalize_prompt(entry["prompt"]) for entry in results}
+        for result in batch_results:
+            if result is None:
+                continue
+            key = normalize_prompt(result["prompt"])
+            if key in seen:
+                print(f"  [{label}] discarded duplicate provider output")
+                continue
+            seen.add(key)
+            unique_results.append(result)
+            append_progress(progress_path, result)
+        return unique_results
 
     round_num = 0
     while len(results) < target_count and round_num < max_backfill_rounds:

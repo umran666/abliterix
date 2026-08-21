@@ -24,7 +24,9 @@ The 500-example sets run ~2x faster than the 1000 sets with no clear quality los
 | `video_good_1000` | 1000 | Should-generate T2V scene prompts (698 matched counterexamples + 302 everyday) |
 | `video_bad_1000` | 1000 | Should-refuse T2V scene prompts across 14 categories (violence, weapons, self-harm, drugs, CBRNE, hate speech, extremism, harassment, sabotage, property destruction, animal cruelty, dangerous stunts, disinformation/deepfake, nudity & sexual content) |
 
-Every `video_bad_1000` row obeys a hard floor: no minors in any unsafe/sexual/violent role, no real identifiable individuals, sexual content kept non-graphic. Category counts aren't perfectly uniform — Gemini's own safety filter blocks some categories (notably CBRNE) far more than others regardless of the research framing.
+Generation uses a hard policy floor: no minors in any unsafe/sexual/violent role, no real identifiable individuals, and sexual content kept non-graphic. The generator also rejects provider refusal boilerplate, unsafe prompts that mention minors, and duplicate outputs before writing a row. Category counts aren't perfectly uniform — Gemini's own safety filter blocks some categories (notably CBRNE) far more than others regardless of the research framing.
+
+> **Regeneration required:** the currently published `video_bad_1000` snapshot predates these post-generation validation gates. An August 2026 audit found 22 provider-refusal rows and one unsafe prompt mentioning a minor; regenerate and republish that split with the current script before using it as a strict safety benchmark.
 
 ## Why we built our own datasets
 

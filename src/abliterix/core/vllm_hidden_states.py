@@ -57,12 +57,17 @@ _SUPPORTED_MODEL_TYPES = {
 }
 
 
-def _load_text_config_data(model_id: str, trust_remote_code: bool) -> dict[str, Any]:
+def _load_text_config_data(
+    model_id: str,
+    trust_remote_code: bool,
+    revision: str | None = None,
+) -> dict[str, Any]:
     """Return text config fields even when Transformers lacks a fresh model type."""
     try:
         auto_cfg = AutoConfig.from_pretrained(
             model_id,
             trust_remote_code=trust_remote_code,
+            revision=revision,
         )
         text_cfg = getattr(auto_cfg, "text_config", auto_cfg)
         if hasattr(text_cfg, "to_dict"):
@@ -72,7 +77,7 @@ def _load_text_config_data(model_id: str, trust_remote_code: bool) -> dict[str, 
         if "does not recognize this architecture" not in str(exc):
             raise
 
-    cfg_path = hf_hub_download(model_id, "config.json")
+    cfg_path = hf_hub_download(model_id, "config.json", revision=revision)
     with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
     text_cfg = cfg.get("text_config") or cfg
@@ -83,7 +88,9 @@ def is_model_supported(config: AbliterixConfig) -> bool:
     """Check if the model's architecture is in extract_hidden_states whitelist."""
     try:
         text_cfg = _load_text_config_data(
-            config.model.model_id, config.model.trust_remote_code or False
+            config.model.model_id,
+            config.model.trust_remote_code or False,
+            config.model.revision,
         )
         model_type = text_cfg.get("model_type", "")
         return model_type in _SUPPORTED_MODEL_TYPES
@@ -136,7 +143,7 @@ def extract_hidden_states_vllm(
 
     # Get number of layers from config. Some newly released vLLM-supported
     # models may not exist in the installed Transformers registry yet.
-    text_cfg = _load_text_config_data(model_id, trust)
+    text_cfg = _load_text_config_data(model_id, trust, config.model.revision)
     num_layers = text_cfg["num_hidden_layers"]
     # Extract ALL layers.
     layer_ids = list(range(num_layers))
@@ -164,6 +171,7 @@ def extract_hidden_states_vllm(
 
     kwargs: dict[str, Any] = dict(
         model=model_id,
+        revision=config.model.revision,
         tensor_parallel_size=tp,
         gpu_memory_utilization=config.model.gpu_memory_utilization,
         trust_remote_code=trust,
@@ -210,13 +218,18 @@ def extract_hidden_states_vllm(
         # Tokenize prompts.  Flatten every set into a single prompt list and
         # remember each set's slice so we can split hidden states back on return.
         try:
-            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust)
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                trust_remote_code=trust,
+                revision=config.model.revision,
+            )
         except AttributeError as exc:
             if "'list' object has no attribute 'keys'" not in str(exc):
                 raise
             tokenizer = AutoTokenizer.from_pretrained(
                 model_id,
                 trust_remote_code=trust,
+                revision=config.model.revision,
                 extra_special_tokens={},
             )
         prompts: list[str] = []

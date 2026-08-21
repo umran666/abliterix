@@ -19,7 +19,7 @@ exclude-newer = "2026-06-19T00:00:00Z"
 
 [[package]]
 name = "abliterix"
-version = "1.11.1"
+version = "1.12.2"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
@@ -28,6 +28,7 @@ dependencies = [
     { name = "hf-transfer" },
     { name = "huggingface-hub" },
     { name = "kernels" },
+    { name = "openai" },
     { name = "optuna" },
     { name = "peft" },
     { name = "psutil" },
@@ -81,6 +82,7 @@ requires-dist = [
     { name = "lm-eval", marker = "extra == 'bench'", specifier = ">=0.4.5" },
     { name = "matplotlib", marker = "extra == 'research'", specifier = "~=3.10" },
     { name = "numpy", marker = "extra == 'research'", specifier = "~=2.2" },
+    { name = "openai", specifier = ">=2,<3" },
     { name = "optuna", specifier = "~=4.5" },
     { name = "pacmap", marker = "extra == 'research'", specifier = "~=0.8" },
     { name = "peft", specifier = "~=0.18" },

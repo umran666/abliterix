@@ -25,6 +25,7 @@ from .eval.scorer import TrialScorer
 from .optimizer import run_search
 from .reproducibility import (
     REPRODUCE_TAG,
+    assess_reproducibility,
     build_manifest,
     repo_weight_shas,
     write_reproduce_artifacts,
@@ -72,9 +73,12 @@ def ask_merge_strategy(config: AbliterixConfig, engine: SteeringEngine) -> str |
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 meta = resolve_model_class(
-                    config.model.model_id, text_only=config.model.text_only
+                    config.model.model_id,
+                    config.model.revision,
+                    text_only=config.model.text_only,
                 ).from_pretrained(
                     config.model.model_id,
+                    revision=config.model.revision,
                     device_map="meta",
                     torch_dtype=torch.bfloat16,
                     trust_remote_code=True,
@@ -203,8 +207,19 @@ def _upload_model(
             "uncensored",
             "decensored",
             "abliterated",
-            REPRODUCE_TAG,
         ]
+        reproducible, reasons = assess_reproducibility(config)
+        if trial.user_attrs.get("steering_recipe") is None:
+            reproducible = False
+            reasons.append("the winning trial has no exact steering recipe")
+        if reproducible:
+            card.data.tags.append(REPRODUCE_TAG)
+        else:
+            print(
+                "[yellow]Model is not tagged reproducible: "
+                + "; ".join(reasons)
+                + "[/]"
+            )
         card.text = (
             generate_model_card(
                 config,

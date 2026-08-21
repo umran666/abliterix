@@ -36,9 +36,9 @@ from rich.traceback import install
 from .analysis import ResidualAnalyzer
 from .core.engine import DEQUANT_CACHE_MAX_BYTES, SteeringEngine, load_tokenizer
 from .data import load_prompt_dataset
-from .eval.detector import RefusalDetector
+from .eval.detector import RefusalDetector, validate_judge_credentials
 from .eval.scorer import TrialScorer
-from .interactive import show_interactive_results
+from .interactive import _restore_selected_trial, show_interactive_results
 from .optimizer import run_search
 from .settings import AbliterixConfig
 from .types import ChatMessage, VectorMethod
@@ -76,7 +76,7 @@ def _load_reproduce_config(repro_path: str) -> "AbliterixConfig | None":
 
     Returns the reconstructed config, or None if the manifest is unusable.
     """
-    from .reproducibility import check_environment, load_manifest
+    from .reproducibility import check_environment, load_manifest, validate_manifest
 
     try:
         manifest = load_manifest(repro_path)
@@ -90,6 +90,12 @@ def _load_reproduce_config(repro_path: str) -> "AbliterixConfig | None":
         f"Reproducing from [bold]{repro_path}[/] "
         f"(abliterix v{manifest.get('abliterix_version')})"
     )
+
+    try:
+        validate_manifest(manifest)
+    except ValueError as error:
+        print(f"[red]Invalid reproduce manifest: {error}[/]")
+        return None
 
     findings = check_environment(manifest)
     if findings:
@@ -512,18 +518,24 @@ def run():
                 if arg == short:
                     sys.argv[i] = full
 
-        # Infer --model.model-id flag if the last argument looks like a model identifier.
+        # Support the unambiguous shorthand ``abliterix owner/model``. Do not
+        # reinterpret an arbitrary final option value as a model ID (for
+        # example the path after ``--optimization.checkpoint-dir``).
         if (
-            len(sys.argv) > 1
+            len(sys.argv) == 2
             and "--model.model-id" not in sys.argv
             and not sys.argv[-1].startswith("-")
         ):
             sys.argv.insert(-1, "--model.model-id")
 
+    reproduce_manifest = None
     if repro_path is not None:
         config = _load_reproduce_config(repro_path)
         if config is None:
             return
+        from .reproducibility import load_manifest
+
+        reproduce_manifest = load_manifest(repro_path)
     else:
         try:
             config = AbliterixConfig()  # ty:ignore[missing-argument]
@@ -540,6 +552,11 @@ def run():
             )
             return
 
+    # Validate the default external evaluator before downloading datasets or
+    # loading a potentially enormous model. This turns a late multi-hour
+    # failure into an immediate actionable error.
+    validate_judge_credentials(config)
+
     _detect_devices()
     _configure_libraries()
 
@@ -553,6 +570,15 @@ def run():
         f"Global seed: [bold]{config.seed}[/]"
         + (" [grey50](randomly chosen)[/]" if _seed_was_random else "")
     )
+
+    # Resolve every Hub input once and load by immutable commit thereafter.
+    from .reproducibility import pin_remote_sources
+
+    resolved_sources = pin_remote_sources(config)
+    if resolved_sources:
+        print("Pinned remote inputs to immutable Hub commits:")
+        for resolved_source in resolved_sources:
+            print(f"* [dim]{resolved_source}[/]")
 
     os.makedirs(config.optimization.checkpoint_dir, exist_ok=True)
 
@@ -704,6 +730,7 @@ def run():
         engine.tokenizer = load_tokenizer(
             config.model.model_id,
             trust_remote_code=config.model.trust_remote_code,
+            revision=config.model.revision,
         )
         if engine.tokenizer.pad_token is None:
             engine.tokenizer.pad_token = engine.tokenizer.eos_token
@@ -767,6 +794,7 @@ def run():
             print()
             print(f"Loading model [bold]{config.model.evaluate_model_id}[/]...")
             config.model.model_id = config.model.evaluate_model_id
+            config.model.revision = config.model.evaluate_model_revision
             engine.restore_baseline()
             print("* Evaluating...")
             scorer.score_trial(engine)
@@ -1307,6 +1335,42 @@ def run():
                 "harmfulness_pair": pair_vectors,
             }
 
+        if reproduce_manifest is not None:
+            from .reproducibility import (
+                compare_reproduction_metrics,
+                manifest_trial,
+            )
+
+            print()
+            print("[bold]Replaying the published winning trial exactly...[/]")
+            replay_trial = manifest_trial(reproduce_manifest)
+            _restore_selected_trial(
+                replay_trial,
+                config,
+                engine,
+                vectors,
+                safety_experts,
+                benign_states=benign_states,
+                target_states=target_states,
+                steering_vector_variants=_vector_variants,
+            )
+            _, replay_kl, replay_refusals, _ = scorer.score_trial(engine)
+            drift = compare_reproduction_metrics(
+                reproduce_manifest,
+                kl_divergence=replay_kl,
+                refusals=replay_refusals,
+            )
+            if drift:
+                details = "; ".join(drift)
+                raise RuntimeError(
+                    "Independent reproduction verification failed: " + details
+                )
+            print(
+                "[bold green]Independent reproduction verified:[/] "
+                f"KL={replay_kl:.6g}, refusals={replay_refusals}."
+            )
+            return
+
         study = run_search(
             config,
             engine,
@@ -1326,6 +1390,66 @@ def run():
                 f"[bold green]Non-interactive mode: optimization finished with "
                 f"{completed} completed trials.[/]"
             )
+            if config.non_interactive_output_dir:
+                from pathlib import Path
+
+                from .reproducibility import (
+                    build_manifest,
+                    local_weight_shas,
+                    write_reproduce_artifacts,
+                )
+
+                complete_trials = [
+                    trial
+                    for trial in study.trials
+                    if trial.state == TrialState.COMPLETE
+                ]
+                if not complete_trials:
+                    raise RuntimeError("No completed trial is available for export.")
+                selected = min(
+                    complete_trials,
+                    key=lambda trial: (
+                        trial.user_attrs["refusals"],
+                        trial.user_attrs["kl_divergence"],
+                    ),
+                )
+                output_dir = Path(config.non_interactive_output_dir).expanduser()
+                if output_dir.exists() and any(output_dir.iterdir()):
+                    raise RuntimeError(
+                        f"Non-interactive output directory is not empty: {output_dir}"
+                    )
+                output_dir.mkdir(parents=True, exist_ok=True)
+                trial_config = _restore_selected_trial(
+                    selected,
+                    config,
+                    engine,
+                    vectors,
+                    safety_experts,
+                    benign_states=benign_states,
+                    target_states=target_states,
+                    steering_vector_variants=_vector_variants,
+                )
+                print(f"Exporting verified trial to [bold]{output_dir}[/]...")
+                merged = engine.export_merged()
+                merged.save_pretrained(output_dir)
+                del merged
+                flush_memory()
+                engine.tokenizer.save_pretrained(output_dir)
+                weight_shas = local_weight_shas(output_dir)
+                if not weight_shas:
+                    raise RuntimeError("Export produced no hashable model weights.")
+                manifest = build_manifest(
+                    trial_config,
+                    selected,
+                    weight_shas=weight_shas,
+                    baseline_refusal_count=scorer.baseline_refusal_count,
+                    n_target_prompts=len(scorer.target_msgs),
+                )
+                write_reproduce_artifacts(output_dir / "reproduce", manifest)
+                print(
+                    f"[bold green]Export verified:[/] {len(weight_shas)} weight "
+                    "file(s) hashed with SHA256."
+                )
             return
 
         show_interactive_results(

@@ -3,6 +3,12 @@ name: Publish to PyPI
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish
+        required: true
+        type: string
 
 jobs:
   publish:
@@ -11,6 +17,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: astral-sh/setup-uv@v6
 
@@ -22,6 +30,6 @@ jobs:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
 
       - name: Create GitHub Release
-        run: gh release create "${{ github.ref_name }}" dist/* --generate-notes
+        run: gh release create "${{ inputs.tag || github.ref_name }}" dist/* --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

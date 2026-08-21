@@ -51,6 +51,8 @@ import torch
 from torch import Tensor
 from torch.nn import Module
 
+from .core.engine import extract_router_expert_ids
+
 
 def _empty_buckets() -> defaultdict[int, defaultdict[int, list[float]]]:
     """Per-layer → per-expert → list of per-prompt activation rates."""
@@ -152,17 +154,12 @@ def identify_safety_experts_safex(
     def _make_hook(layer_idx: int, n_experts: int):
         def hook(module: Module, inp: Any, out: Any):
             with torch.no_grad():
-                # Router output shapes vary by family — extract the
-                # top-k selection tensor in the same order the engine's
-                # canonical hook does (see engine.identify_safety_experts).
-                if isinstance(out, tuple) and len(out) >= 3:
-                    selected = out[2]
-                elif isinstance(out, tuple) and len(out) == 2:
-                    selected = out[1]
-                else:
-                    logits = out if not isinstance(out, tuple) else out[0]
-                    k = getattr(module, "top_k", 8)
-                    _, selected = logits.topk(k, dim=-1)
+                # Same family-agnostic expert-id probe as
+                # engine.identify_safety_experts (Bailing v3 puts
+                # indices first, not in out[2]).
+                selected = extract_router_expert_ids(
+                    out, top_k=getattr(module, "top_k", 8)
+                )
 
                 _record_prompt_rates(active[0], layer_idx, selected, n_experts)
 

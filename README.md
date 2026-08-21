@@ -30,6 +30,7 @@ It also ships **HonestAbliterationBench**, a reproducible public benchmark that 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Stable and Reproducible by Default](#stable-and-reproducible-by-default)
 - [How It Works](#how-it-works)
 - [Broken Defenses](#broken-defenses)
 - [Results](#results)
@@ -55,28 +56,58 @@ abliterix --model Qwen/Qwen3-4B-Instruct-2507
 
 That's it. The process is fully automatic — after optimization completes, you can save the model, upload to Hugging Face, or chat with it interactively.
 
+The default evaluator is deterministic and offline. For a semantic LLM-judge audit, opt in explicitly; the credential is checked before any model is loaded:
+
+```bash
+export OPENROUTER_API_KEY=...
+abliterix --model Qwen/Qwen3-4B-Instruct-2507 --detection.llm-judge
+```
+
 > **Reproducible install (recommended)**: Abliterix uses [uv](https://docs.astral.sh/uv/) and commits a `uv.lock` pinning every dependency, plus a `[tool.uv] exclude-newer` cutoff so lock regeneration can't drift onto a newer dep that breaks the GPU path. If you use uv, clone the repo and run `uv run abliterix --model <model>` to get the exact dependency set the maintainers tested against.
 
 > **Windows**: use `python scripts/run_abliterix.py --model <model>` or set `PYTHONIOENCODING=utf-8` to avoid Rich encoding issues.
+
+
+## Stable and Reproducible by Default
+
+Abliterix resolves every remote model and dataset input to an immutable Hugging Face commit before loading it. The HF default uses orthogonal projection plus full row-norm preservation; vLLM automatically uses `pre`, the strongest normalization its rank-1 projection cache can materialize. A global seed controls search and randomized low-rank operations.
+
+Published reproducibility manifests use schema v2 and include the resolved configuration, exact winning-trial steering recipe, model/dataset commits, environment, metrics, and model-weight SHA256 values. The `reproducible` tag is only added when all inputs are pinned, the source tree is clean, the evaluator is deterministic, and the backend supports exact materialization.
+
+```bash
+# Exact replay: verifies manifest integrity, applies the winning trial without
+# searching, then independently re-measures KL divergence and refusal count.
+abliterix --reproduce reproduce/reproduce.json
+
+# Headless optimization + exact best-trial export + hashes + manifest.
+abliterix --model org/model --non-interactive \
+  --non-interactive-output-dir ./verified-model
+```
+
+CI also runs a commit-pinned tiny model twice, requires identical exported weight hashes, and verifies exact manifest replay. See [`tests/e2e/`](tests/e2e/) and the [Heretic parity audit](research_heretic_stability_reproducibility_20260806.md).
 
 
 ## How It Works
 
 Abliterix modifies model internals rather than relying on prompt-level jailbreaks. Its basic assumption is that benign prompts and prompts that trigger refusal produce measurably different activation patterns in the model's residual stream.
 
-For each layer, let \(g\) be the mean activation for benign prompts and \(b\) the mean activation for target prompts. The simplest refusal direction is:
+<p align="center">
+  <img src="assets/how-it-works.svg" alt="How Abliterix extracts activations, derives a refusal direction, projects it out of model weights, and optimizes the refusal-versus-drift trade-off" width="100%">
+</p>
 
-\[
-r = \operatorname{normalize}(b-g)
-\]
+For each layer, let $g$ be the mean activation for benign prompts and $b$ the mean activation for target prompts. The simplest refusal direction is:
+
+$$
+r = \frac{b-g}{\lVert b-g \rVert_2}
+$$
 
 Abliteration removes weight components aligned with this direction. A simplified input-side transformation is:
 
-\[
+$$
 W' = W-\alpha(Wr)r^\top
-\]
+$$
 
-where \(\alpha\) controls the intervention strength. In practice, Abliterix can apply the corresponding projection on either side of a weight matrix, depending on whether a module reads from or writes to the residual stream.
+where $\alpha$ controls the intervention strength. In practice, Abliterix can apply the corresponding projection on either side of a weight matrix, depending on whether a module reads from or writes to the residual stream.
 
 The automated pipeline is:
 

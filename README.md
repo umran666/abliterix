@@ -27,8 +27,18 @@
 
 It also ships **HonestAbliterationBench**, a reproducible public benchmark that resists the two failure modes (short generations + keyword-only judges) that make most abliteration leaderboards meaningless.
 
+## Safety and Responsible Use
+
+> [!WARNING]
+> Abliterix intentionally modifies model internals to reduce refusal behavior. This can weaken or remove safeguards and may cause resulting models to generate inaccurate, biased, offensive, explicit, dangerous, or illegal content.
+
+Abliterix is experimental research software. You are responsible for evaluating any resulting model, complying with applicable laws and third-party terms, and deploying appropriate safeguards. Do not rely on generated outputs for medical, legal, financial, safety-critical, or other high-stakes decisions without qualified human review.
+
+Before use or deployment, read the full **[Safety, Responsible Use, and Disclaimer Notice](SAFETY.md)**. The software is provided **"AS IS"**, without warranty, under Sections 15–17 of the [AGPL-3.0-or-later](LICENSE). The safety guidance does not add restrictions to the rights granted by the AGPL.
+
 ## Table of Contents
 
+- [Safety and Responsible Use](#safety-and-responsible-use)
 - [Quick Start](#quick-start)
 - [Stable and Reproducible by Default](#stable-and-reproducible-by-default)
 - [How It Works](#how-it-works)

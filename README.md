@@ -285,6 +285,7 @@ All contributions are released under the [AGPL-3.0](LICENSE) license.
 
 - **Questions & ideas**: [GitHub Discussions](https://github.com/wuwangzhang1216/abliterix/discussions)
 - **Bugs & feature requests**: [GitHub Issues](https://github.com/wuwangzhang1216/abliterix/issues)
+- **Security vulnerabilities**: follow the private reporting process in [SECURITY.md](SECURITY.md)
 - **Share your models**: tag models you publish with `abliterix` on the Hugging Face Hub so others can find them — browse the growing list at [huggingface.co/models?other=abliterix](https://huggingface.co/models?other=abliterix). Uploading through the built-in menu adds this tag (plus a `reproducible` tag and a `reproduce/` manifest) automatically.
 
 

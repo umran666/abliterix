@@ -52,7 +52,7 @@ def _populate_model_reference_holders(engine, model):
     engine._dequant_cache[id(weight)] = weight.detach()
     engine._lora_b_weights = [weight]
     engine._router_originals = [(0, 0, weight.detach()[0])]
-    engine._expert_deltas = [(0, 0, 1.0, weight.detach()[0], weight.detach()[0])]
+    engine._expert_deltas = [(0, 0, weight.detach()[0].clone())]
     engine._direct_weight_originals = {weight: weight.detach().clone()}
     # cliff_head.py stores (weight, head, slice.clone()) keyed by (id, head).
     engine._cliff_head_originals = {

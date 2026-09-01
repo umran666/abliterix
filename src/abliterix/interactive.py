@@ -197,6 +197,7 @@ def _upload_model(
         card = ModelCard.load(card_path) if card_path.exists() else None
     else:
         card = ModelCard.load(config.model.model_id)
+    weight_shas: dict[str, str] = {}
     if card is not None:
         if card.data is None:
             card.data = ModelCardData()
@@ -212,7 +213,6 @@ def _upload_model(
         # afterwards (as this did) meant a Hub timeout produced zero hashes,
         # no SHA256SUMS file, and a model still tagged `reproducible` — the
         # one guarantee the tag is supposed to make.
-        weight_shas: dict[str, str] = {}
         try:
             weight_shas = repo_weight_shas(repo_id, token)
         except Exception as error:  # noqa: BLE001 - Hub I/O raises many types

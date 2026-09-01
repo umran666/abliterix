@@ -491,7 +491,8 @@ def local_weight_shas(model_dir: str | Path) -> dict[str, str]:
         with path.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
-        shas[path.name] = digest.hexdigest()
+        rel_path = path.relative_to(root).as_posix()
+        shas[rel_path] = digest.hexdigest()
     return shas
 
 

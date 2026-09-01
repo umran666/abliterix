@@ -12,8 +12,22 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-if hasattr(torch, "utils") and hasattr(torch.utils, "_pytree") and not hasattr(torch.utils._pytree, "register_constant"):
-    torch.utils._pytree.register_constant = lambda cls: None
+if (
+    hasattr(torch, "utils")
+    and hasattr(torch.utils, "_pytree")
+    and not hasattr(torch.utils._pytree, "register_constant")
+):
+    def _compat_register_constant(cls):
+        _reg = getattr(
+            torch.utils._pytree,
+            "_register_pytree_node",
+            getattr(torch.utils._pytree, "register_pytree_node", None),
+        )
+        if _reg is not None:
+            return _reg(cls, lambda x: ((), x), lambda children, context: context)
+        return cls
+
+    torch.utils._pytree.register_constant = _compat_register_constant
 
 
 _orig_argv = list(sys.argv)

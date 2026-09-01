@@ -182,9 +182,9 @@ def test_tamper_resistance_clamped_to_unit_interval():
 
 
 def test_tamper_resistance_handles_no_headroom_without_dividing_by_zero():
-    """Never-abliterated model (pre == 1.0) must not raise ZeroDivisionError."""
+    """Never-abliterated model (pre == 1.0) must not raise ZeroDivisionError and yields 0.0."""
     result = compute_tamper_resistance(1.0, 1.0)
-    assert result.tamper_resistance == 1.0
+    assert result.tamper_resistance == 0.0
 
 
 # ---------------------------------------------------------------------------

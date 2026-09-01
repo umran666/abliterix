@@ -1753,7 +1753,13 @@ def _apply_moe_steering(
                 continue
 
             for eid, _ in top:
-                original_slice = fused.data[eid].detach().clone()
+                if (
+                    hasattr(engine, "_direct_weight_originals")
+                    and fused in engine._direct_weight_originals
+                ):
+                    original_slice = engine._direct_weight_originals[fused][eid].detach().clone()
+                else:
+                    original_slice = fused.data[eid].detach().clone()
                 if fused_scale is not None:
                     W = _dequantize_fp8_blockwise(fused.data[eid], fused_scale)
                 else:

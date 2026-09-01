@@ -81,44 +81,45 @@ def extract_hidden_states_speculators(
 
     generator = VllmHiddenStatesGenerator(**kwargs)
 
-    # Tokenize prompts using the model's tokenizer + chat template.
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id,
-        trust_remote_code=True,
-        revision=config.model.revision,
-    )
-
-    token_ids_list: list[list[int]] = []
-    for msg in messages:
-        chat = [
-            {"role": "system", "content": msg.system},
-            {"role": "user", "content": msg.user},
-        ]
-        try:
-            text = tokenizer.apply_chat_template(
-                chat,
-                add_generation_prompt=True,
-                tokenize=False,
-                enable_thinking=False,
-            )
-        except TypeError:
-            text = tokenizer.apply_chat_template(
-                chat,
-                add_generation_prompt=True,
-                tokenize=False,
-            )
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        token_ids_list.append(ids)
-
-    print(
-        f"* Extracting hidden states for {len(messages)} prompts "
-        f"({num_layers} layers, TP={tp})..."
-    )
-
-    # The teardown below must run on the failure path too: the caller's
-    # documented behaviour is to fall back to another backend after an
-    # error, and that only works if the vLLM engine's VRAM is released.
+    # The teardown below must run on the failure path too (including tokenizer
+    # failures): the caller's documented behaviour is to fall back to another
+    # backend after an error, and that only works if the vLLM engine's VRAM
+    # is released.
     try:
+        # Tokenize prompts using the model's tokenizer + chat template.
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            revision=config.model.revision,
+        )
+
+        token_ids_list: list[list[int]] = []
+        for msg in messages:
+            chat = [
+                {"role": "system", "content": msg.system},
+                {"role": "user", "content": msg.user},
+            ]
+            try:
+                text = tokenizer.apply_chat_template(
+                    chat,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                text = tokenizer.apply_chat_template(
+                    chat,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            token_ids_list.append(ids)
+
+        print(
+            f"* Extracting hidden states for {len(messages)} prompts "
+            f"({num_layers} layers, TP={tp})..."
+        )
+
         results = generator.generate(token_ids=token_ids_list)
 
         # Collect hidden states at the requested token offset.

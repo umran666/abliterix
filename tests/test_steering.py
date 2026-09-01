@@ -315,7 +315,9 @@ def test_ega_plus_moe_baseline_restore_idempotent():
     model = torch.nn.Module()
     model.model = torch.nn.Module()
     model.model.layers = torch.nn.ModuleList([layer0])
-    model.config = SimpleNamespace(name_or_path="test-model", _name_or_path="test-model")
+    model.config = SimpleNamespace(
+        name_or_path="test-model", _name_or_path="test-model"
+    )
     engine.model = model
     engine._truncate_to_hidden_layers = lambda m, layers: layers
     engine._locate_fused_weights = lambda lyr: lyr.mlp.experts.down_proj
@@ -359,6 +361,6 @@ def test_ega_plus_moe_baseline_restore_idempotent():
         engine.restore_baseline()
 
         # Confirm tensor returned exactly to pristine baseline
-        assert torch.allclose(
-            fused_param.data, pristine_baseline, atol=1e-7
-        ), f"Failed on cycle {cycle}"
+        assert torch.allclose(fused_param.data, pristine_baseline, atol=1e-7), (
+            f"Failed on cycle {cycle}"
+        )

@@ -1757,7 +1757,9 @@ def _apply_moe_steering(
                     hasattr(engine, "_direct_weight_originals")
                     and fused in engine._direct_weight_originals
                 ):
-                    original_slice = engine._direct_weight_originals[fused][eid].detach().clone()
+                    original_slice = (
+                        engine._direct_weight_originals[fused][eid].detach().clone()
+                    )
                 else:
                     original_slice = fused.data[eid].detach().clone()
                 if fused_scale is not None:

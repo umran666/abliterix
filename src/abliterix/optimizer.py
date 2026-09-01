@@ -34,7 +34,7 @@ from .types import (
     SteeringMode,
     SteeringProfile,
 )
-from .util import humanize_duration, print, report_memory
+from .util import flush_memory, humanize_duration, print, report_memory
 
 
 def run_search(
@@ -575,6 +575,9 @@ def run_search(
                         engine._current_adapter_path = None
                     config.steering.direct_transform = original_direct_transform
                     config.steering.decay_kernel = original_decay_kernel
+            # Return freed VRAM between trials so long Optuna runs on large MoE
+            # models do not accumulate allocator fragmentation.
+            flush_memory()
 
     # ----------------------------------------------------------------
     # Study creation / resumption

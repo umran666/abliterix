@@ -129,9 +129,17 @@ def _install_mtp_layer_type_validator() -> None:
 _install_mtp_layer_type_validator()
 
 
+# Cap the dequantised-weight cache so large MoE expert counts cannot retain
+# hundreds of GB of fp32 copies in RAM.  Shared by SteeringEngine.__init__ and
+# the fast vLLM engine shell in cli.py so the two cannot drift apart.
+DEQUANT_CACHE_MAX_BYTES = 4 * 1024**3  # 4 GiB
+
+
 def resolve_model_class(
     model_id: str,
     revision: str | None = None,
+    *,
+    text_only: bool = False,
 ) -> Type[AutoModelForImageTextToText] | Type[AutoModelForCausalLM]:
     """Choose the correct AutoModel class based on the model's configuration.
 
@@ -139,11 +147,35 @@ def resolve_model_class(
     ``AutoModelForImageTextToText``; their text backbone is accessed via the
     ``model.language_model`` path in ``transformer_layers``.  Pure text models
     use ``AutoModelForCausalLM``.
+
+    When *text_only* is true, always return ``AutoModelForCausalLM`` even if
+    the checkpoint advertises multimodal fields (opt-in for text abliteration
+    of dual-registered MoE VLMs such as some Qwen3.5-MoE checkpoints).
     """
     configs = PretrainedConfig.get_config_dict(model_id, revision=revision)
-    if any("vision_config" in cfg for cfg in configs):
+    if text_only:
+        return AutoModelForCausalLM
+
+    config_dicts = configs if isinstance(configs, tuple) else (configs,)
+
+    if any(isinstance(cfg, dict) and "vision_config" in cfg for cfg in config_dicts):
         return AutoModelForImageTextToText
     return AutoModelForCausalLM
+
+
+def _bf16_compute_supported() -> bool:
+    """True when the active accelerator has native (non-emulated) bf16.
+
+    ``torch.cuda.is_bf16_supported()`` defaults to including software
+    emulation, so pre-Ampere CUDA cards still return True. We only treat
+    ROCm and sm_80+ as native bf16 so older CUDA targets can fall back to
+    float16 for both bnb compute dtype and residual promotion.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if torch.version.hip:  # ROCm: native on supported archs
+        return True
+    return torch.cuda.get_device_capability()[0] >= 8
 
 
 def _register_mtp_layer_types_adapter(
@@ -377,6 +409,10 @@ class SteeringEngine:
         self.response_prefix = ""
         self.needs_reload = False
         self._dequant_cache: dict[int, Tensor] = {}
+        self._dequant_cache_bytes: int = 0
+        # Cap dequant cache so large MoE expert counts cannot retain
+        # hundreds of GB of fp32 weights in RAM.
+        self._dequant_cache_max_bytes: int = DEQUANT_CACHE_MAX_BYTES
 
         # Cached metadata — populated by prepare_for_unload() before the HF
         # model is freed, so the optimizer can still query layer/component
@@ -522,7 +558,7 @@ class SteeringEngine:
             print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
 
             try:
-                qconfig = self._build_quant_config(dtype)
+                qconfig = self._build_quant_config()
 
                 extra: dict[str, Any] = {}
                 if qconfig is not None:
@@ -565,7 +601,9 @@ class SteeringEngine:
                     )
 
                 self.model = resolve_model_class(
-                    model_id, config.model.revision
+                    model_id,
+                    config.model.revision,
+                    text_only=config.model.text_only,
                 ).from_pretrained(
                     model_id,
                     **{_dtype_kwarg: dtype},
@@ -649,6 +687,24 @@ class SteeringEngine:
 
         if self.model is None:
             raise RuntimeError("Failed to load model with all configured dtypes.")
+
+        # bnb 4-bit: non-quantized tensors (embed/norm/lm_head) may still be
+        # float16 after load (including dtype="auto" when the checkpoint is
+        # float16). When native bf16 is available, promote live float16 params
+        # so residual norms match the bf16 compute path. Skip promotion when
+        # we fell back to float16 compute (pre-Ampere CUDA). Parameters on
+        # meta (accelerate offload) may not retain this.
+        if (
+            config.model.quant_method == QuantMode.BNB_4BIT
+            and _bf16_compute_supported()
+        ):
+            n_conv = 0
+            for _n, _p in self.model.named_parameters():
+                if _p.dtype == torch.float16:
+                    _p.data = _p.data.to(torch.bfloat16)
+                    n_conv += 1
+            if n_conv:
+                print(f"  [dim]Promoted {n_conv} non-quantized params fp16→bf16[/]")
 
         # NOTE: FP8 dequant is now applied inside the dtype loop (above),
         # before the smoke-test, so we no longer need it here.
@@ -994,11 +1050,16 @@ class SteeringEngine:
         except Exception:
             pass  # Best-effort; if this fails, the original error will surface.
 
-    def _build_quant_config(self, dtype: str) -> BitsAndBytesConfig | None:
+    def _build_quant_config(self) -> BitsAndBytesConfig | None:
         """Translate the user-facing QuantMode into a BitsAndBytesConfig."""
         qm = self.config.model.quant_method
         if qm == QuantMode.BNB_4BIT:
-            compute_dtype = torch.bfloat16 if dtype == "auto" else getattr(torch, dtype)
+            # Prefer native bf16 compute for residual dynamic range; fall back
+            # to float16 on pre-Ampere CUDA (and CPU). Does not control which
+            # modules are quantized — only matmul compute dtype.
+            compute_dtype = (
+                torch.bfloat16 if _bf16_compute_supported() else torch.float16
+            )
             return BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=compute_dtype,
@@ -1254,6 +1315,7 @@ class SteeringEngine:
         # anything left here pins the model's VRAM after
         # ``engine.model = None`` (issue #83).
         self._dequant_cache.clear()
+        self._dequant_cache_bytes = 0
         for handle in getattr(self, "_angular_hooks", []):
             handle.remove()
         self._angular_hooks = []
@@ -1480,13 +1542,15 @@ class SteeringEngine:
         self.model = None  # ty:ignore[invalid-assignment]
         flush_memory()
 
-        qconfig = self._build_quant_config(str(dtype).split(".")[-1])
+        qconfig = self._build_quant_config()
         extra: dict[str, Any] = {}
         if qconfig is not None:
             extra["quantization_config"] = qconfig
 
         self.model = resolve_model_class(
-            self.config.model.model_id, self.config.model.revision
+            self.config.model.model_id,
+            self.config.model.revision,
+            text_only=self.config.model.text_only,
         ).from_pretrained(
             self.config.model.model_id,
             **{_dtype_kwarg: dtype},
@@ -1551,7 +1615,9 @@ class SteeringEngine:
 
             print("* Loading base model on CPU (this may take a while)...")
             base = resolve_model_class(
-                self.config.model.model_id, self.config.model.revision
+                self.config.model.model_id,
+                self.config.model.revision,
+                text_only=self.config.model.text_only,
             ).from_pretrained(
                 self.config.model.model_id,
                 **{_dtype_kwarg: self.model.dtype},
@@ -1573,6 +1639,15 @@ class SteeringEngine:
             merged = self.model.merge_and_unload()
             self.needs_reload = True
             return merged
+
+    def _cache_dequant(self, mid: int, weight: Tensor) -> None:
+        """Store a dequantized weight tensor if under the byte budget.
+
+        Pure performance cache: skipping an insert only costs re-dequant time.
+        """
+        if self._dequant_cache_bytes < self._dequant_cache_max_bytes:
+            self._dequant_cache[mid] = weight
+            self._dequant_cache_bytes += weight.nelement() * weight.element_size()
 
     def export_adapter(self, save_directory: str | os.PathLike[str]) -> None:
         """Save the active LoRA adapter without BF16 merge-rounding drift.
@@ -1597,6 +1672,21 @@ class SteeringEngine:
             )
         if not isinstance(self.model, PeftModel):
             raise RuntimeError("No active PEFT LoRA adapter is available to export.")
+        # `export_merged()` calls `merge_and_unload()` in place on the
+        # unquantized path: the LoRA layers are folded into the base weights
+        # and removed, but `self.model` stays a PeftModel object.  The
+        # isinstance check above therefore still passes and PEFT would happily
+        # write a zero-tensor adapter.  `needs_reload` is the engine's
+        # canonical "weights were destructively mutated" flag; the state-dict
+        # check also covers any other route to an emptied adapter.
+        if self.needs_reload or not any(
+            "lora_" in name for name, _ in self.model.named_parameters()
+        ):
+            raise RuntimeError(
+                "The in-memory LoRA adapter was consumed by a previous merged "
+                "export. Re-select the trial to reload the base model before "
+                "exporting an adapter."
+            )
 
         self.model.save_pretrained(save_directory)
 

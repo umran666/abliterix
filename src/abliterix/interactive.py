@@ -73,7 +73,9 @@ def ask_merge_strategy(config: AbliterixConfig, engine: SteeringEngine) -> str |
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 meta = resolve_model_class(
-                    config.model.model_id, config.model.revision
+                    config.model.model_id,
+                    config.model.revision,
+                    text_only=config.model.text_only,
                 ).from_pretrained(
                     config.model.model_id,
                     revision=config.model.revision,
@@ -129,6 +131,25 @@ def _save_model_locally(config: AbliterixConfig, engine: SteeringEngine):
     flush_memory()
     engine.tokenizer.save_pretrained(save_dir)
     print(f"Model saved to [bold]{save_dir}[/].")
+
+
+def _save_lora_adapter_locally(config: AbliterixConfig, engine: SteeringEngine):
+    """Save only the PEFT LoRA adapter and tokenizer files."""
+    save_dir = ask_path("Path to the adapter folder:")
+    if not save_dir:
+        return
+
+    print("Saving LoRA adapter only...")
+    try:
+        # Use the guarded export path (rejects non-LoRA, router/expert base
+        # edits, and non-PeftModel backends such as bare vLLM HF shells).
+        engine.export_adapter(save_dir)
+    except RuntimeError as error:
+        print(f"[red]{error}[/]")
+        return
+    engine.tokenizer.save_pretrained(save_dir)
+    print(f"LoRA adapter saved to [bold]{save_dir}[/].")
+    print("[green]Base model weights were not merged or exported.[/]")
 
 
 def _upload_model(
@@ -612,6 +633,7 @@ def show_interactive_results(
                     "What do you want to do with the decensored model?",
                     [
                         "Save the model to a local folder",
+                        "Save LoRA adapter only",
                         "Upload the model to Hugging Face",
                         "Chat with the model",
                         "Run standard benchmarks (lm-eval)",
@@ -626,6 +648,9 @@ def show_interactive_results(
                     match action:
                         case "Save the model to a local folder":
                             _save_model_locally(trial_config, engine)
+
+                        case "Save LoRA adapter only":
+                            _save_lora_adapter_locally(trial_config, engine)
 
                         case "Upload the model to Hugging Face":
                             _upload_model(trial_config, engine, scorer, trial)

@@ -512,7 +512,7 @@ def apply_steering(
                                 qs,
                             ).to(torch.float32),
                         )
-                        engine._dequant_cache[mid] = W
+                        engine._cache_dequant(mid, W)
                 elif CB is not None:
                     # Int8 quantisation: dequantise from CB data and SCB row scales.
                     mid = id(mod)
@@ -521,7 +521,7 @@ def apply_steering(
                     else:
                         SCB = base_weight.SCB  # ty:ignore[unresolved-attribute]
                         W = CB.float() * SCB.float().unsqueeze(1) / 127.0
-                        engine._dequant_cache[mid] = W
+                        engine._cache_dequant(mid, W)
                 elif _FP8_DTYPES and base_weight.dtype in _FP8_DTYPES:
                     # FP8: dequantise to fp32 via block-wise or per-tensor scale.
                     # Checks `weight_scale_inv` (block-wise; DeepSeek / MiniMax-M2
@@ -551,7 +551,7 @@ def apply_steering(
                                 scale,
                                 out_dtype=torch.float32,
                             )
-                        engine._dequant_cache[mid] = W
+                        engine._cache_dequant(mid, W)
                 else:
                     W = base_weight.to(torch.float32)
 

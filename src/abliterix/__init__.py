@@ -7,24 +7,21 @@
 """Abliterix — Automated model steering and alignment adjustment via LoRA-based optimization."""
 
 import torch
+import torch.utils._pytree as _pytree
 
-if (
-    hasattr(torch, "utils")
-    and hasattr(torch.utils, "_pytree")
-    and not hasattr(torch.utils._pytree, "register_constant")
-):
+if not hasattr(_pytree, "register_constant"):
 
     def _compat_register_constant(cls):
         _reg = getattr(
-            torch.utils._pytree,
+            _pytree,
             "register_pytree_node",
-            getattr(torch.utils._pytree, "_register_pytree_node", None),
+            getattr(_pytree, "_register_pytree_node", None),
         )
         if _reg is not None:
             return _reg(cls, lambda x: ((), x), lambda children, context: context)
         return cls
 
-    torch.utils._pytree.register_constant = _compat_register_constant  # type: ignore[attr-defined]
+    _pytree.register_constant = _compat_register_constant  # type: ignore[attr-defined]
 
 from .core.engine import SteeringEngine
 from .eval.detector import RefusalDetector

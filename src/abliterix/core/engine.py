@@ -1568,6 +1568,7 @@ class SteeringEngine:
         # addresses, so a surviving entry would hand the next trial a stale
         # dequantized weight tensor from a *different* model object.
         self._dequant_cache.clear()
+        self._dequant_cache_bytes = 0
 
         qconfig = self._build_quant_config()
         extra: dict[str, Any] = {}

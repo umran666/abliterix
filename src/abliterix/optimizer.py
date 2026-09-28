@@ -51,8 +51,12 @@ def run_search(
     *,
     steering_vector_variants: dict[str, "torch.Tensor"] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    raise_on_interrupt: bool = False,
 ) -> optuna.Study:
     """Execute the Optuna optimisation loop and return the completed study.
+
+    ``raise_on_interrupt`` lets non-interactive callers report SIGINT after
+    trial cleanup. Interactive callers retain the completed study by default.
 
     Parameters
     ----------
@@ -554,6 +558,8 @@ def run_search(
             try:
                 return _objective(trial)
             except KeyboardInterrupt:
+                if raise_on_interrupt:
+                    raise
                 trial.study.stop()
                 raise TrialPruned()
         finally:
@@ -647,7 +653,8 @@ def run_search(
             callbacks=[_stop_when_requested],
         )
     except KeyboardInterrupt:
-        pass
+        if raise_on_interrupt:
+            raise
 
     if _count_complete() == opt.num_trials:
         study.set_user_attr("finished", True)

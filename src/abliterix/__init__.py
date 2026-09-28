@@ -6,7 +6,6 @@
 
 """Abliterix — Automated model steering and alignment adjustment via LoRA-based optimization."""
 
-import torch
 import torch.utils._pytree as _pytree
 
 if not hasattr(_pytree, "register_constant"):

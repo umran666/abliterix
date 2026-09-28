@@ -198,6 +198,12 @@ def _upload_model(
     else:
         card = ModelCard.load(config.model.model_id)
     weight_shas: dict[str, str] = {}
+    # Hash independently of model-card availability, before deciding its tag.
+    try:
+        weight_shas = repo_weight_shas(repo_id, token)
+    except Exception as error:  # noqa: BLE001 - best-effort Hub I/O
+        print(f"[yellow]Could not hash uploaded weight shards: {error}[/]")
+
     if card is not None:
         if card.data is None:
             card.data = ModelCardData()
@@ -209,17 +215,6 @@ def _upload_model(
             "decensored",
             "abliterated",
         ]
-        # Hash the uploaded shards *before* deciding the tag. Computing them
-        # afterwards (as this did) meant a Hub timeout produced zero hashes,
-        # no SHA256SUMS file, and a model still tagged `reproducible` — the
-        # one guarantee the tag is supposed to make.
-        try:
-            weight_shas = repo_weight_shas(repo_id, token)
-        except Exception as error:  # noqa: BLE001 - Hub I/O raises many types
-            # and any of them must degrade to "not reproducible" rather than
-            # abort an otherwise successful upload.
-            print(f"[yellow]Could not hash uploaded weight shards: {error}[/]")
-
         reproducible, reasons = assess_reproducibility(config)
         if trial.user_attrs.get("steering_recipe") is None:
             reproducible = False

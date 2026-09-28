@@ -1401,6 +1401,7 @@ def run() -> int:
             benign_states=benign_states,
             target_states=target_states,
             steering_vector_variants=_vector_variants,
+            raise_on_interrupt=config.non_interactive,
         )
 
         if config.non_interactive:

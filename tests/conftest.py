@@ -28,12 +28,13 @@ if not hasattr(_pytree, "register_constant"):
     _pytree.register_constant = _compat_register_constant
 
 
-_orig_argv = list(sys.argv)
-try:
-    sys.argv = ["test", "--model.model-id", "test/model-001"]
-    from abliterix.settings import AbliterixConfig  # noqa: E402
-finally:
-    sys.argv = _orig_argv
+from abliterix.settings import AbliterixConfig  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def isolate_config_argv(monkeypatch):
+    """Config construction must not consume pytest's CLI arguments."""
+    monkeypatch.setattr(sys, "argv", ["test", "--model.model-id", "test/model-001"])
 
 
 @pytest.fixture

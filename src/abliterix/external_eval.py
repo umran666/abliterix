@@ -40,6 +40,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .eval.detector import classify_response_batch
+
 
 # ---------------------------------------------------------------------------
 # Result dataclasses
@@ -103,7 +105,9 @@ def evaluate_jailbreak(
         Takes ``attack_prompts``, returns the generated responses.
     detector : RefusalDetector-like
         ``classify_batch(responses) -> Iterable[bool]`` where True =
-        refusal.
+        refusal. Prompt-aware detectors may instead expose
+        ``classify_batch_result(responses, prompts=...)``. Unknown or missing
+        verdicts raise rather than entering the reported success rate.
     attack_prompts : list
         Prompts in whatever format the generator expects.
     attack_name : str
@@ -115,10 +119,8 @@ def evaluate_jailbreak(
     if not attack_prompts:
         return JailbreakResult(attack_name, 0, 0, 0.0, [])
     responses = generator(attack_prompts)
-    refusals = list(detector.classify_batch(responses))
-    # ``not None`` is True, so an unresolved label would be scored as a
-    # successful jailbreak. Unknown labels are excluded, matching the
-    # convention in eval/metrics.py.
+    refusals = classify_response_batch(detector, responses, attack_prompts)
+    # The harness requires complete verdicts before calculating a rate.
     n_succeeded = sum(1 for r in refusals if r is False)
     n = len(responses)
     return JailbreakResult(
@@ -168,7 +170,7 @@ def evaluate_multi_turn(
         for turn_idx, prompt in enumerate(chain, start=1):
             history.append(prompt)
             responses = generator(history)
-            refusals = list(detector.classify_batch(responses))
+            refusals = classify_response_batch(detector, responses, [prompt])
             if refusals and refusals[0] is False:
                 succeeded = True
                 total_turns += turn_idx

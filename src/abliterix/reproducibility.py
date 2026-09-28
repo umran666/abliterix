@@ -375,6 +375,9 @@ def build_manifest(
 
     if weight_shas:
         manifest["weights"] = dict(sorted(weight_shas.items()))
+    else:
+        reproducible = False
+        reasons.append("no weight-shard SHA256 checksums could be computed")
 
     manifest["reproducible"] = reproducible
     manifest["reproducibility_reasons"] = reasons

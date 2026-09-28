@@ -22,7 +22,7 @@ import urllib.request
 from collections import Counter
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from typing import cast
+from typing import Any, cast
 
 from ..settings import AbliterixConfig
 from ..types import ChatMessage
@@ -413,16 +413,49 @@ class RefusalDetector:
 
         return False
 
-    def classify_batch(self, responses: Iterable[str]) -> list[bool]:
-        """Classify already-generated *responses*; ``True`` means refusal.
+    def classify_batch_result(
+        self,
+        responses: Iterable[str],
+        *,
+        prompts: Iterable[str | ChatMessage] | None = None,
+    ) -> ComplianceResult:
+        """Classify existing responses with the configured evaluator.
 
-        This is the protocol ``external_eval`` and ``polyrefuse`` document
-        and call. It is the generation-free counterpart of
-        :meth:`evaluate_compliance`: callers that already hold the text (for
-        example a jailbreak harness that produced it) must not have to
-        re-generate it just to score it.
+        Judge mode requires the original prompts and preserves unknown labels.
+        Keyword mode also works without prompts. Neither path regenerates text.
         """
-        return [self.detect_refusal(response) for response in responses]
+        texts = list(responses)
+        questions = list(prompts) if prompts is not None else None
+        if questions is not None and len(questions) != len(texts):
+            raise ValueError("prompts and responses must have the same length")
+        if self.config.detection.llm_judge:
+            if questions is None:
+                raise ValueError("LLM judge classification requires original prompts")
+            pairs: list[tuple[str, str]] = []
+            for question, response in zip(questions, texts):
+                if isinstance(question, ChatMessage):
+                    question = question.user
+                if not isinstance(question, str):
+                    raise TypeError(
+                        "judge prompts must be strings or ChatMessage objects"
+                    )
+                pairs.append((question, response))
+            return self._batch_judge_classify_result(pairs)
+        return ComplianceResult(
+            labels=tuple(self.detect_refusal(response) for response in texts),
+            evaluator="keyword",
+            protocol_version=f"refusal-detector-cache-v{_CACHE_SCHEMA_VERSION}",
+        )
+
+    def classify_batch(
+        self,
+        responses: Iterable[str],
+        *,
+        prompts: Iterable[str | ChatMessage] | None = None,
+    ) -> list[bool]:
+        """Classify existing responses, rejecting unresolved judge verdicts."""
+        result = self.classify_batch_result(responses, prompts=prompts)
+        return cast(list[bool], list(result.require_complete().labels))
 
     def evaluate_compliance(self, engine, target_msgs: list[ChatMessage]) -> int:
         """Count refusals across *target_msgs* using the configured strategy.
@@ -927,3 +960,40 @@ class RefusalDetector:
             protocol_version=self._judge_prompt_hash,
             issues=tuple(sorted(issues)),
         )
+
+
+def classify_response_batch(
+    detector: Any,
+    responses: list[str],
+    prompts: list[Any],
+) -> list[bool]:
+    """Adapt prompt-aware and legacy detectors for strict evaluation harnesses.
+
+    Rich detectors expose ``classify_batch_result(responses, prompts=...)``.
+    Legacy detectors may expose ``classify_batch(responses)`` or
+    ``detect_refusal(response)``. Every response must have one known verdict;
+    transport failures must never be reported as model behavior.
+    """
+    if len(responses) != len(prompts):
+        raise ValueError("generator must return one response per prompt")
+    classify_result = getattr(detector, "classify_batch_result", None)
+    if callable(classify_result):
+        result = classify_result(responses, prompts=prompts)
+        labels = list(result.require_complete().labels)
+    elif callable(getattr(detector, "classify_batch", None)):
+        labels = list(detector.classify_batch(responses))
+    elif callable(getattr(detector, "detect_refusal", None)):
+        labels = [detector.detect_refusal(response) for response in responses]
+    else:
+        raise TypeError(
+            "detector must expose classify_batch_result, classify_batch, "
+            "or detect_refusal"
+        )
+    if len(labels) != len(responses):
+        raise ValueError("detector must return one verdict per response")
+    if any(label is not None and type(label) is not bool for label in labels):
+        raise TypeError("detector verdicts must be bool or None")
+    complete = ComplianceResult(
+        labels=tuple(labels), evaluator="batch", protocol_version="strict-v1"
+    ).require_complete()
+    return cast(list[bool], list(complete.labels))
